@@ -77,7 +77,7 @@
                                            (.put "error" (:error event)))]
                           (.accept progress-callback java-event))))]
     (when-let [error (datamart/validate-config clj-config)]
-      (throw (IllegalArgumentException. error)))
+      (throw (IllegalArgumentException. ^String error)))
     (datamart/result->java-map (datamart/create-cache db clj-config progress-fn))))
 
 (defn -isAttached [^String database-code]

@@ -119,7 +119,9 @@
 (defn seq->arraylist
   "Convert a Clojure sequence to Java ArrayList."
   [coll]
-  (ArrayList. ^java.util.Collection (or coll [])))
+  ;; vec, not (or ... []): a type hint on a macro form is dropped during
+  ;; expansion, leaving a reflective ctor call that native-image can't resolve.
+  (ArrayList. ^java.util.Collection (vec coll)))
 
 (defn build-qualified-table-ref
   "Build a fully qualified and escaped table reference.

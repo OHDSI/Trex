@@ -65,7 +65,7 @@
    Runs until the hades job reaches a terminal status."
   [trexsql-db study-id hades-job-id spring-batch-exec-id]
   (loop []
-    (Thread/sleep poll-interval-ms)
+    (Thread/sleep (long poll-interval-ms))
     (let [hades (query-hades-status trexsql-db hades-job-id)]
       (if (nil? hades)
         (do
