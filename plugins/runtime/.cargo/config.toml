@@ -1,5 +1,9 @@
 [env]
-RUSTY_V8_MIRROR = "https://github.com/p-hoffmann/rusty_v8/releases/download"
+# Upstream artifacts are usable: the fork's binding.cc/.gn/BUILD.gn are
+# byte-identical to upstream v150.4.0 -- its only changes are Rust
+# (src/cppgc.rs guards, a build.rs sysroot fix) and compile locally.
+# Upstream publishes macOS assets; the fork publishes linux only.
+RUSTY_V8_MIRROR = "https://github.com/denoland/rusty_v8/releases/download"
 # https://supabase.com/docs/guides/functions/limits
 SUPABASE_RESOURCE_LIMIT_MEM_MB = "256"
 SUPABASE_RESOURCE_LIMIT_LOW_MEM_MULTIPLIER = "5"
