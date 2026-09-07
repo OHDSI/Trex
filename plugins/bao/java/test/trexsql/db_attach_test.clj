@@ -40,3 +40,39 @@
              (#'db/redact-credentials "password=''p w''" {:user "u" :password "p w"}))))
     (testing "blank/nil credentials are not used as replacement patterns"
       (is (= "host=h" (#'db/redact-credentials "host=h" {:user "" :password nil}))))))
+
+;; `session <n> busy` is the pool's transient "another thread holds this
+;; session's connection" error, not a real attach failure — see
+;; retry-while-busy in trexsql.db.
+(deftest retry-while-busy-test
+  (let [retry-while-busy #'db/retry-while-busy]
+
+    (testing "a busy failure is retried and the eventual value returned"
+      (let [attempts (atom 0)]
+        (is (= :attached
+               (retry-while-busy
+                 (fn []
+                   (when (< (swap! attempts inc) 3)
+                     (throw (ex-info "ATTACH ...: session 20 busy" {})))
+                   :attached))))
+        (is (= 3 @attempts))))
+
+    (testing "a non-busy failure propagates on the first attempt, unmasked"
+      (let [attempts (atom 0)]
+        (is (thrown-with-msg?
+              clojure.lang.ExceptionInfo #"locked by another process"
+              (retry-while-busy
+                (fn []
+                  (swap! attempts inc)
+                  (throw (ex-info "Cache file is locked by another process" {}))))))
+        (is (= 1 @attempts))))
+
+    (testing "a session held past the budget surfaces the original error"
+      (let [attempts (atom 0)]
+        (is (thrown-with-msg?
+              clojure.lang.ExceptionInfo #"session 20 busy"
+              (retry-while-busy
+                (fn []
+                  (swap! attempts inc)
+                  (throw (ex-info "ATTACH ...: session 20 busy" {}))))))
+        (is (= 5 @attempts))))))

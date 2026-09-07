@@ -170,6 +170,39 @@
       (make-database handle {:cache-path cache-path
                              :database-code database-code}))))
 
+;; The trex handle is shared across WebAPI's request threads, but the pool
+;; hands out one Connection per session and `take_conn` (plugins/pool) returns
+;; `session <n> busy` rather than waiting when another thread already holds it.
+;; Two concurrent requests therefore make ATTACH fail even though nothing is
+;; wrong — and a failed auto-attach leaves the frontend seeing
+;; `cacheAttached:false`, which it maps to status='error' and then refuses to
+;; fire any count/inclusion calls. The contention is brief (one query), so a
+;; bounded retry turns it back into a wait; a session held longer than the
+;; budget still surfaces the original error.
+(defn- session-busy-error?
+  [^Throwable e]
+  (boolean (some->> (.getMessage e) (re-find #"(?i)session \d+ busy"))))
+
+(def ^:private busy-max-attempts 5)
+
+(defn- retry-while-busy
+  "Call f, retrying only the transient session-busy failure. Any other error
+   propagates on the first attempt so real failures are not masked."
+  [f]
+  (loop [attempt 1
+         delay-ms 20]
+    (let [outcome (try
+                    {:value (f)}
+                    (catch Exception e
+                      (if (and (session-busy-error? e) (< attempt busy-max-attempts))
+                        {:busy e}
+                        (throw e))))]
+      (if (contains? outcome :value)
+        (:value outcome)
+        (do
+          (Thread/sleep (long delay-ms))
+          (recur (inc attempt) (min (* delay-ms 2) 200)))))))
+
 (defn attach-cache-file!
   "Attach a TrexSQL cache file. If the alias is already attached but the
    underlying file no longer exists (e.g. it was deleted on disk while the
@@ -204,9 +237,10 @@
       (try (execute! db (format "DETACH %s" escaped-alias))
            (catch Exception _ nil)))
     (try
-      (execute! db (format "ATTACH IF NOT EXISTS '%s' AS %s"
-                           escaped-path
-                           escaped-alias))
+      (retry-while-busy
+        #(execute! db (format "ATTACH IF NOT EXISTS '%s' AS %s"
+                              escaped-path
+                              escaped-alias)))
       database-code
       (catch clojure.lang.ExceptionInfo e
         (if (re-find #"(?i)lock" (.getMessage e))
