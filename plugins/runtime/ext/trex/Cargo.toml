@@ -9,7 +9,7 @@ license = "Apache-2.0"
 path = "lib.rs"
 
 [dependencies]
-deno_core = "0.400.0"
+deno_core = "0.410.0"
 deno_error = "=0.7.1"
 duckdb = { version = "1.4.4", features = ["vtab-arrow"] }
 chrono = { version = "0.4.40", features = ["serde"] }
