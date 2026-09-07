@@ -1,4 +1,11 @@
-import { executeQueryStream, sqlLoggingEnabled, redactSecrets } from './trex_lib.js';
+// Imports use absolute `ext:trex/...` specifiers, not relative paths.
+// These modules are registered as `lazy_loaded_esm` and are resolved by
+// deno_core's `LazyEsmModuleLoader`, which calls `resolve_import` directly.
+// Unlike the eager `ExtModuleLoader`, it has no special handling for `ext:`
+// referrers, and `ext:trex/trex_lib.js` is a cannot-be-a-base URL, so a
+// relative specifier fails with "relative URL with a cannot-be-a-base base".
+// Same convention as `ext/node`'s polyfills, which are lazily loaded too.
+import { executeQueryStream, sqlLoggingEnabled, redactSecrets } from "ext:trex/trex_lib.js";
 
 const NOVALUE = "NoValue"
 
