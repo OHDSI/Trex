@@ -20,8 +20,8 @@
       (reset! embedded-extensions-temp-dir (.toFile temp-dir))
       ;; Register shutdown hook to clean up
       (.addShutdownHook (Runtime/getRuntime)
-                        (Thread. #(when-let [dir @embedded-extensions-temp-dir]
-                                    (doseq [f (.listFiles dir)]
+                        (Thread. #(when-let [^File dir @embedded-extensions-temp-dir]
+                                    (doseq [^File f (.listFiles dir)]
                                       (.delete f))
                                     (.delete dir))))))
   @embedded-extensions-temp-dir)
@@ -34,7 +34,7 @@
         resource (io/resource resource-path)]
     (when resource
       (let [temp-dir (get-embedded-extensions-dir)
-            ext-file (File. temp-dir (str ext-name ".trex"))]
+            ext-file (File. ^File temp-dir ^String (str ext-name ".trex"))]
         (when-not (.exists ext-file)
           (println (str "Extracting embedded extension: " ext-name))
           (with-open [in (io/input-stream resource)
@@ -133,7 +133,7 @@
         {:name ext-name :loaded false :error "No AVX support"})
 
       :else
-      (if-let [ext-file (extract-embedded-extension ext-name)]
+      (if-let [^File ext-file (extract-embedded-extension ext-name)]
         (try
           (println (str "Loading embedded extension: " ext-name))
           (native/execute! handle (str "LOAD '" (.getAbsolutePath ext-file) "'"))
@@ -199,7 +199,7 @@
           ;; Size match is sufficient: .trex artifacts change with every build,
           ;; so size collision across versions is vanishingly unlikely.
           (when (or (not (.exists dst))
-                    (not= (.length src) (.length dst)))
+                    (not= (.length ^File src) (.length ^File dst)))
             (io/copy src dst))
           (.getAbsolutePath dst))))))
 

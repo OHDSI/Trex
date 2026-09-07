@@ -118,9 +118,9 @@
         body (assoc :body body)
         options (assoc :options
                        (cond-> {}
-                         (.get options "timeout-ms") (assoc :timeout-ms (.get options "timeout-ms"))
-                         (some? (.get options "follow-redirects")) (assoc :follow-redirects (.get options "follow-redirects"))
-                         (.get options "max-redirects") (assoc :max-redirects (.get options "max-redirects"))))))))
+                         (get options "timeout-ms") (assoc :timeout-ms (get options "timeout-ms"))
+                         (some? (get options "follow-redirects")) (assoc :follow-redirects (get options "follow-redirects"))
+                         (get options "max-redirects") (assoc :max-redirects (get options "max-redirects"))))))))
 
 (defn http-request
   "Execute HTTP request to user worker. Returns map with :success, :status-code, :headers, :body, :error."

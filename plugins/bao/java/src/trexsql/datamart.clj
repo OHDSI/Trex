@@ -177,7 +177,9 @@
     (.put "schema-name" (:schema-name result))
     (.put "tables-copied" (tables-to-arraylist (:tables-copied result) table-result->java-map))
     (.put "tables-failed" (tables-to-arraylist (:tables-failed result) table-error->java-map))
-    (.put "fts-indexes-created" (ArrayList. ^java.util.Collection (or (:fts-indexes-created result) [])))
+    ;; vec, not (or ... []): a type hint on a macro form is dropped during
+    ;; expansion, so the hinted `or` still compiled to a reflective ctor call.
+    (.put "fts-indexes-created" (ArrayList. ^java.util.Collection (vec (:fts-indexes-created result))))
     (.put "duration-ms" (:duration-ms result))
     (.put "error" (:error result))))
 
@@ -298,8 +300,11 @@
                           (db/escape-identifier chunk-col "chunk-col")
                           source-table)
           row (first (db/query db sql-str))
-          lo (some-> row (.get "lo"))
-          hi (some-> row (.get "hi"))]
+          ;; clojure.core/get, not .get: db/query hands back java HashMaps and
+          ;; the interop form compiles to a reflective call that native-image
+          ;; cannot resolve. get reads a java.util.Map without reflection.
+          lo (get row "lo")
+          hi (get row "hi")]
       (when (and (number? lo) (number? hi))
         [(long lo) (long hi)]))
     (catch Exception e
@@ -364,7 +369,7 @@
       (copy-rows! db table-name select-clause source-table target-table where-clause config)
       (let [count-sql (format "SELECT COUNT(*) as cnt FROM %s" target-table)
             count-result (db/query db count-sql)
-            row-count (or (some-> count-result first (.get "cnt")) 0)]
+            row-count (or (get (first count-result) "cnt") 0)]
         (->TableResult table-name row-count 0)))
     (catch Exception e
       (->TableError table-name (.getMessage e) "copy"))))

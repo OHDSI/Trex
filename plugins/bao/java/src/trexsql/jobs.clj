@@ -8,7 +8,8 @@
             [trexsql.json :as json]
             [honey.sql :as sql]
             [honey.sql.helpers :as h])
-  (:import [java.sql Connection DriverManager PreparedStatement ResultSet SQLException]
+  (:import [javax.sql DataSource]
+           [java.sql Connection DriverManager PreparedStatement ResultSet SQLException]
            [java.util Properties HashMap]
            [java.time Instant LocalDateTime ZoneId]
            [java.io File]))
@@ -377,9 +378,15 @@
 ;; therefore discards the write: the JOB_INSTANCE insert never lands and the
 ;; JOB_EXECUTION insert then fails job_inst_exec_fk. Do the whole write on one
 ;; connection and commit it, which also makes instance+execution atomic.
+;; Type-hinted for the same reason as the File constructors above: unhinted,
+;; every call here goes through clojure.lang.Reflector, and inside
+;; libwebapi-native.so (GraalVM native-image) HikariDataSource's methods are not
+;; registered for reflection, so opening the job threw
+;; "No matching field found: getConnection for class HikariDataSource" and every
+;; cache build ran without a job row.
 (defn- with-tx
-  [datasource f]
-  (with-open [conn (.getConnection datasource)]
+  [^DataSource datasource f]
+  (with-open [^Connection conn (.getConnection datasource)]
     (let [prev (.getAutoCommit conn)]
       (.setAutoCommit conn false)
       (try

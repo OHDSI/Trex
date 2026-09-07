@@ -173,8 +173,8 @@
           (when on-retry
             (on-retry attempt (:error result)))
           (log/warn (format "Retrying after transient error (attempt %d/%d): %s"
-                            attempt max-retries (.getMessage (:error result))))
-          (Thread/sleep delay)
+                            attempt max-retries (.getMessage ^Throwable (:error result))))
+          (Thread/sleep (long delay))
           (recur (inc attempt) (min (* delay 2) max-delay-ms)))
 
         :else
@@ -303,7 +303,7 @@
   "Copy a single table from a JDBC source into the attached cache catalog.
    DDL targets `<cache-alias>.<table-name>`; the Appender targets the same
    catalog via trexsql_appender_create_ext."
-  [trexsql-db source-conn cache-alias table-name config progress-fn]
+  [trexsql-db ^Connection source-conn cache-alias table-name config progress-fn]
   (let [start-time (System/currentTimeMillis)
         {:keys [schema-name fetch-size column-filter patient-filter timestamp-filter]} config
         fetch-size (or fetch-size default-fetch-size)]
@@ -456,7 +456,7 @@
       (if use-pooling
         ;; Use connection pooling
         (with-connection-pool [pool pool-config]
-          (run-with-connection #(.getConnection pool)))
+          (run-with-connection #(.getConnection ^HikariDataSource pool)))
         ;; Direct connection (for testing or simple cases)
         (run-with-connection #(doto (DriverManager/getConnection jdbc-url user password)
                                (.setReadOnly true)
@@ -468,7 +468,7 @@
    the ext-form appender_create."
   [trexsql-db config progress-fn get-conn-fn start-time database-code schema-name
    cache-path table-filter webapi-ds]
-  (with-open [source-conn (get-conn-fn)]
+  (with-open [^Connection source-conn (get-conn-fn)]
     (let [tables-to-copy (get-tables-to-copy source-conn trexsql-db database-code schema-name table-filter)
           total-tables (count tables-to-copy)
           exec-id (jobs/write-spring-batch-job! trexsql-db "cacheGeneration"
@@ -537,7 +537,7 @@
                              {:max-retries 3
                               :on-retry (fn [attempt err]
                                           (jobs/update-retry-status! trexsql-db database-code
-                                            attempt (.getMessage err)))})]
+                                            attempt (.getMessage ^Throwable err)))})]
                 (if (:success? result)
                   (let [new-total (+ total-rows-processed (or (:rows-copied result) 0))]
                     (when progress-fn

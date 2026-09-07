@@ -191,7 +191,7 @@ Examples:
       :else
       (let [{:keys [source cache-path json]} options
             db (core/init {:cache-path cache-path})
-            cache-file (java.io.File. cache-path (str source ".db"))
+            cache-file (java.io.File. ^String cache-path ^String (str source ".db"))
             exists? (.exists cache-file)]
         (try
           (let [job-status (try (jobs/get-job-status db source) (catch Exception _ nil))
