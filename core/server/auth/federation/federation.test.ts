@@ -1,6 +1,7 @@
 import { assertEquals, assertNotEquals, assertRejects, assertThrows } from "jsr:@std/assert";
 import { applyClaimMap, federationEnabled } from "./config.ts";
 import { signState, stateKey, verifyState } from "./state.ts";
+import { challengeFor, createVerifier } from "./pkce.ts";
 
 Deno.test("federationEnabled is off unless explicitly enabled", () => {
   assertEquals(federationEnabled(undefined), false);
@@ -91,4 +92,20 @@ Deno.test("expired state is rejected", async () => {
     Error,
     "expired",
   );
+});
+
+Deno.test("verifier is unreserved-charset and long enough for RFC 7636", () => {
+  const v = createVerifier();
+  assertEquals(v.length >= 43 && v.length <= 128, true);
+  assertEquals(/^[A-Za-z0-9\-._~]+$/.test(v), true);
+});
+
+Deno.test("verifiers are not repeated", () => {
+  assertNotEquals(createVerifier(), createVerifier());
+});
+
+Deno.test("challenge is the base64url SHA-256 of the verifier", async () => {
+  // Known vector from RFC 7636 appendix B.
+  const challenge = await challengeFor("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
+  assertEquals(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
 });
