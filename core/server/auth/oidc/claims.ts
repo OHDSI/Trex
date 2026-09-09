@@ -13,6 +13,10 @@ export interface IdTokenUser {
   /** Named application roles. This is what a relying party authorizes against. */
   appRoles: string[];
   emailVerified?: boolean;
+  /** Raw upstream group identifiers. Unmapped: meaning belongs to the relying party. */
+  idpGroups?: string[];
+  /** sso_provider.id the session was federated from; absent for native logins. */
+  idpProvider?: string;
 }
 
 export interface IdTokenOptions {
@@ -42,6 +46,8 @@ export interface IdTokenClaims {
   // authorizes against.
   roles: string[];
   app_metadata: { trex_role: string };
+  idp_groups?: string[];
+  idp_provider?: string;
 }
 
 /**
@@ -73,6 +79,14 @@ export function buildIdTokenClaims(user: IdTokenUser, opts: IdTokenOptions): IdT
   }
   if (opts.scopes.includes("profile") && user.name) {
     claims.name = user.name;
+  }
+  // Behind its own scope: group lists are large and only usermgmt needs them,
+  // so relying parties that do not ask are not made to carry them. Gated also
+  // on idpProvider so a native (password) login never emits either claim,
+  // scope request notwithstanding — there is no upstream identity to report.
+  if (opts.scopes.includes("idp_groups") && user.idpProvider) {
+    claims.idp_groups = user.idpGroups ?? [];
+    claims.idp_provider = user.idpProvider;
   }
 
   return claims;

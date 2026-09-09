@@ -10,6 +10,7 @@ import {
 import { hashPassword, verifyPassword } from "./password.ts";
 import { authLimiter, apiLimiter } from "../middleware/rate-limit.ts";
 import { isRefreshTokenExpired } from "./refresh-token-ttl.ts";
+import { loadProviders } from "./federation/providers.ts";
 
 const router = Router();
 router.use(express.json());
@@ -773,19 +774,6 @@ router.get("/accounts", apiLimiter, async (req, res) => {
 
 router.get("/settings", apiLimiter, async (_req, res) => {
   try {
-    // Check which SSO providers are enabled
-    let providers: Record<string, boolean> = {};
-    try {
-      const result = await pool.query(
-        `SELECT id FROM trexdb.sso_provider WHERE enabled = true`,
-      );
-      for (const row of result.rows) {
-        providers[row.id] = true;
-      }
-    } catch {
-      // Table may not exist yet
-    }
-
     // Check self-registration
     let disableSignup = true;
     try {
@@ -797,14 +785,15 @@ router.get("/settings", apiLimiter, async (_req, res) => {
       // Default: disabled
     }
 
+    // Providers come from sso_provider so a client can discover what is
+    // actually configured, rather than a fixed list that is wrong either way.
+    const external: Record<string, boolean> = { email: true };
+    for (const id of (await loadProviders(pool)).keys()) {
+      external[id] = true;
+    }
+
     res.json({
-      external: {
-        email: true,
-        google: providers["google"] || false,
-        github: providers["github"] || false,
-        microsoft: providers["microsoft"] || false,
-        apple: providers["apple"] || false,
-      },
+      external,
       disable_signup: disableSignup,
       mailer_autoconfirm: true,
       phone_autoconfirm: false,

@@ -318,3 +318,29 @@ Deno.test("return_to keeps a non-default port and the scheme", () => {
     "http://localhost:33001/oidc/authorize",
   );
 });
+
+Deno.test("idp_groups are emitted only under the idp_groups scope", () => {
+  const user = {
+    id: "u-1", email: "jo@example.test", role: "user", appRoles: [],
+    idpGroups: ["group-guid-1"], idpProvider: "entra",
+  };
+  const withScope = buildIdTokenClaims(user, {
+    issuer: "https://trex.test", audience: "atlas", scopes: ["openid", "idp_groups"],
+  });
+  assertEquals(withScope.idp_groups, ["group-guid-1"]);
+  assertEquals(withScope.idp_provider, "entra");
+
+  const without = buildIdTokenClaims(user, {
+    issuer: "https://trex.test", audience: "atlas", scopes: ["openid"],
+  });
+  assertEquals(without.idp_groups, undefined);
+  assertEquals(without.idp_provider, undefined);
+});
+
+Deno.test("a native login emits no idp claims even under the scope", () => {
+  const claims = buildIdTokenClaims(
+    { id: "u-1", email: "jo@example.test", role: "user", appRoles: [] },
+    { issuer: "https://trex.test", audience: "atlas", scopes: ["openid", "idp_groups"] },
+  );
+  assertEquals(claims.idp_groups, undefined);
+});
