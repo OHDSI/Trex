@@ -16,14 +16,21 @@ export interface StatePayload {
 export const STATE_TTL_SECONDS = 600;
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 function b64url(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+function b64urlDecode(s: string): Uint8Array {
+  const norm = s.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = norm.length % 4 === 0 ? norm : norm + "=".repeat(4 - (norm.length % 4));
+  return Uint8Array.from(atob(pad), (c) => c.charCodeAt(0));
+}
+
 /** HMAC key for state, derived from the root key like the agents OAuth broker's. */
 export async function stateKey(rootKey?: string): Promise<CryptoKey> {
-  const raw = await deriveSubkeyBase64(LABELS.agentsOAuthState, rootKey);
+  const raw = await deriveSubkeyBase64(LABELS.federationState, rootKey);
   return crypto.subtle.importKey(
     "raw",
     Uint8Array.from(atob(raw), (c) => c.charCodeAt(0)),
@@ -34,7 +41,7 @@ export async function stateKey(rootKey?: string): Promise<CryptoKey> {
 }
 
 export async function signState(payload: StatePayload, key: CryptoKey): Promise<string> {
-  const body = btoa(JSON.stringify(payload)).replace(/=+$/, "");
+  const body = b64url(encoder.encode(JSON.stringify(payload)));
   const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
   return `${body}.${b64url(new Uint8Array(sig))}`;
 }
@@ -59,7 +66,7 @@ export async function verifyState(
   for (let i = 0; i < expected.length; i++) diff |= provided.charCodeAt(i) ^ expected.charCodeAt(i);
   if (diff !== 0) throw new Error("state signature is invalid");
 
-  const payload = JSON.parse(atob(body)) as StatePayload;
+  const payload = JSON.parse(decoder.decode(b64urlDecode(body))) as StatePayload;
   if (payload.exp <= now) throw new Error("state has expired");
   return payload;
 }

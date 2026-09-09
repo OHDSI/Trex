@@ -10,6 +10,13 @@ export const LABELS = {
   // the auth-exempt consent routes). Derived from the root key so no separate
   // secret needs provisioning; rotating the root key rotates it.
   agentsOAuthState: "trex.agents.oauth.state.v1",
+  // HMAC key for the OIDC federation relying-party's signed `state` (carries
+  // provider, return path, nonce and PKCE verifier through the browser
+  // redirect). A distinct subkey from agentsOAuthState above: same pattern
+  // (derived from the root key, no separate provisioning), but a different
+  // label — sharing one HMAC key across two unrelated signing contexts would
+  // let a MAC minted for one verify in the other over the same bytes.
+  federationState: "trex.federation.state.v1",
 } as const;
 
 export type SubkeyLabel = typeof LABELS[keyof typeof LABELS];
