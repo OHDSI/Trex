@@ -41,7 +41,17 @@ export async function loadProviders(client: PgClient): Promise<Map<string, Provi
 
 export async function findUserIdByEmail(client: PgClient, email: string): Promise<string | null> {
   const { rows } = await client.query(
-    `SELECT id FROM trexdb."user" WHERE lower(email) = lower($1) LIMIT 1`,
+    // A match here becomes a link decision: an upstream identity is handed
+    // the account it resolves to. Soft-deleted and banned users must never
+    // resolve, or a deactivated account is resurrected for whoever controls
+    // that address at the identity provider. Both columns are nullable with
+    // NULL meaning "not disabled", so `banned = false` alone would wrongly
+    // drop NULL rows; `IS NOT TRUE` treats NULL and false as not-banned.
+    `SELECT id FROM trexdb."user"
+      WHERE lower(email) = lower($1)
+        AND "deletedAt" IS NULL
+        AND banned IS NOT TRUE
+      LIMIT 1`,
     [email],
   );
   return rows[0]?.id ?? null;

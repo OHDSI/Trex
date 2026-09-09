@@ -13,9 +13,10 @@ ALTER TABLE trexdb.sso_provider
   ADD COLUMN IF NOT EXISTS link_policy    TEXT    NOT NULL DEFAULT 'verified_email',
   ADD COLUMN IF NOT EXISTS auto_provision BOOLEAN NOT NULL DEFAULT false;
 
--- Postgres has no `ADD CONSTRAINT IF NOT EXISTS`, and this migration runner
--- replays applied migrations, so a bare ADD CONSTRAINT would error on the
--- second run. Guard it on pg_constraint instead.
+-- Postgres has no `ADD CONSTRAINT IF NOT EXISTS`. Nothing here guarantees this
+-- migration only ever runs once against a given database (a rebuilt schema,
+-- a manual replay), so a bare ADD CONSTRAINT could still hit an
+-- already-constrained table. Guard it on pg_constraint instead.
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -27,6 +28,24 @@ BEGIN
     ALTER TABLE trexdb.sso_provider
       ADD CONSTRAINT sso_provider_groups_source_check
       CHECK (groups_source IN ('claim', 'graph', 'none'));
+  END IF;
+END
+$$;
+
+-- ProviderConfig.linkPolicy is typed as the literal "verified_email"; enforce
+-- that guarantee in the database too; a stray row is otherwise a runtime
+-- type violation the app would only discover by crashing on it.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_constraint
+      WHERE conname = 'sso_provider_link_policy_check'
+        AND conrelid = 'trexdb.sso_provider'::regclass
+  ) THEN
+    ALTER TABLE trexdb.sso_provider
+      ADD CONSTRAINT sso_provider_link_policy_check
+      CHECK (link_policy IN ('verified_email'));
   END IF;
 END
 $$;
