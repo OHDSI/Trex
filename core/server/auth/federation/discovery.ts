@@ -52,9 +52,10 @@ export async function loadDiscovery(
   if (filtered.length === 0) {
     throw new Error(`discovery document lists no usable signing algorithms; advertised: ${doc.id_token_signing_alg_values_supported.join(", ")}`);
   }
-  doc.id_token_signing_alg_values_supported = filtered;
+  doc.id_token_signing_alg_values_supported = Object.freeze(filtered) as string[];
 
-  // Freeze to prevent mutations from poisoning the cache.
+  // Freeze to prevent mutations from poisoning the cache. The algorithm array is frozen
+  // separately above to catch poisoning on the field that matters most for security.
   cache.set(url, { doc: Object.freeze(doc), fetchedAt: now });
   return doc;
 }

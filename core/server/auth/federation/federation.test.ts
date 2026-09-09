@@ -167,17 +167,34 @@ Deno.test("discovery cache is frozen; mutations do not affect subsequent fetches
   const c = { n: 0 };
   const url = "https://logto.test/.well-known/openid-configuration";
   const doc1 = await loadDiscovery(url, stubFetch(DOC, c), 1000);
-  // Attempt to mutate the returned document; frozen objects reject mutations silently or throw
+
+  // Attempt to mutate top-level string property; frozen objects reject mutations
   try {
     (doc1 as unknown as Record<string, unknown>).token_endpoint = "https://evil.test/token";
   } catch {
-    // Expected: frozen object
+    // Expected: frozen object in strict mode
   }
+
+  // Attempt to mutate the algorithm array via push; frozen array rejects mutations
+  try {
+    doc1.id_token_signing_alg_values_supported.push("HS256");
+  } catch {
+    // Expected: frozen array in strict mode
+  }
+
+  // Attempt to mutate array via index assignment; frozen array rejects mutations
+  try {
+    (doc1.id_token_signing_alg_values_supported as unknown[])[0] = "none";
+  } catch {
+    // Expected: frozen array in strict mode
+  }
+
   // Fetch again from cache; returns the same frozen instance
   const doc2 = await loadDiscovery(url, stubFetch(DOC, c), 1001);
-  // The cached value is unchanged
+  // All mutations are rejected; cached value is unchanged
   assertEquals(doc2.token_endpoint, "https://logto.test/oidc/token");
-  assertEquals(c.n, 1);
+  assertEquals(doc2.id_token_signing_alg_values_supported, ["RS256", "ES384"]);
+  assertEquals(c.n, 1); // Only one fetch, no refetch
 });
 
 Deno.test("discovery cache expires at exactly the TTL boundary", async () => {
