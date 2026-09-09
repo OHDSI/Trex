@@ -1,10 +1,10 @@
 import { assertEquals, assertNotEquals, assertRejects, assertThrows } from "jsr:@std/assert";
-import { exportJWK, generateKeyPair, SignJWT } from "npm:jose";
+import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "npm:jose";
 import { applyClaimMap, federationEnabled } from "./config.ts";
 import { signState, stateKey, verifyState } from "./state.ts";
 import { challengeFor, createVerifier } from "./pkce.ts";
-import { clearDiscoveryCache, loadDiscovery, type DiscoveryDoc } from "./discovery.ts";
-import { verifyIdToken } from "./verify.ts";
+import { clearDiscoveryCache, loadDiscovery } from "./discovery.ts";
+import { verifyFederatedIdToken } from "./verify.ts";
 
 Deno.test("federationEnabled is off unless explicitly enabled", () => {
   assertEquals(federationEnabled(undefined), false);
@@ -274,39 +274,48 @@ async function signedIdToken(over: Record<string, unknown> = {}) {
     .setSubject("s-1")
     .setExpirationTime("5m")
     .sign(privateKey);
-  return { token, jwks: { keys: [jwk] } };
-}
-
-function docWithJwks(jwks: unknown): DiscoveryDoc & { _jwks: unknown } {
-  return { ...DOC, _jwks: jwks } as DiscoveryDoc & { _jwks: unknown };
+  return { token, jwks: createLocalJWKSet({ keys: [jwk] }) };
 }
 
 Deno.test("a well-formed id_token verifies", async () => {
   const { token, jwks } = await signedIdToken();
-  const claims = await verifyIdToken(token, {
-    doc: docWithJwks(jwks), clientId: "d2e-client", nonce: "n-1",
+  const claims = await verifyFederatedIdToken(token, {
+    doc: DOC, clientId: "d2e-client", nonce: "n-1", jwks,
   });
   assertEquals(claims.sub, "s-1");
 });
 
 Deno.test("a wrong audience is rejected", async () => {
   const { token, jwks } = await signedIdToken({ aud: "someone-else" });
-  await assertRejects(() => verifyIdToken(token, {
-    doc: docWithJwks(jwks), clientId: "d2e-client", nonce: "n-1",
-  }));
+  await assertRejects(
+    () => verifyFederatedIdToken(token, { doc: DOC, clientId: "d2e-client", nonce: "n-1", jwks }),
+    Error,
+    "aud",
+  );
 });
 
 Deno.test("a wrong issuer is rejected", async () => {
   const { token, jwks } = await signedIdToken({ iss: "https://evil.test" });
-  await assertRejects(() => verifyIdToken(token, {
-    doc: docWithJwks(jwks), clientId: "d2e-client", nonce: "n-1",
-  }));
+  await assertRejects(
+    () => verifyFederatedIdToken(token, { doc: DOC, clientId: "d2e-client", nonce: "n-1", jwks }),
+    Error,
+    "iss",
+  );
 });
 
 Deno.test("a mismatched nonce is rejected", async () => {
   const { token, jwks } = await signedIdToken({ nonce: "other" });
   await assertRejects(
-    () => verifyIdToken(token, { doc: docWithJwks(jwks), clientId: "d2e-client", nonce: "n-1" }),
+    () => verifyFederatedIdToken(token, { doc: DOC, clientId: "d2e-client", nonce: "n-1", jwks }),
+    Error,
+    "nonce",
+  );
+});
+
+Deno.test("a token with no nonce claim is rejected even against an empty-string nonce", async () => {
+  const { token, jwks } = await signedIdToken({ nonce: undefined });
+  await assertRejects(
+    () => verifyFederatedIdToken(token, { doc: DOC, clientId: "d2e-client", nonce: "", jwks }),
     Error,
     "nonce",
   );
@@ -314,9 +323,10 @@ Deno.test("a mismatched nonce is rejected", async () => {
 
 Deno.test("an algorithm the provider does not advertise is rejected", async () => {
   const { token, jwks } = await signedIdToken();
-  const doc = { ...docWithJwks(jwks), id_token_signing_alg_values_supported: ["ES384"] };
+  const doc = { ...DOC, id_token_signing_alg_values_supported: ["ES384"] };
   await assertRejects(
-    () => verifyIdToken(token, { doc, clientId: "d2e-client", nonce: "n-1" }),
+    () => verifyFederatedIdToken(token, { doc, clientId: "d2e-client", nonce: "n-1", jwks }),
     Error,
+    "alg",
   );
 });
