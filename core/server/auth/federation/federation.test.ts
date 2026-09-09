@@ -1,12 +1,20 @@
 import { assertEquals, assertNotEquals, assertRejects, assertThrows } from "jsr:@std/assert";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "npm:jose";
 import { applyClaimMap, federationEnabled } from "./config.ts";
-import { signState, stateKey, verifyState } from "./state.ts";
+import { hashBinding, signState, stateKey, verifyState } from "./state.ts";
 import { challengeFor, createVerifier } from "./pkce.ts";
 import { clearDiscoveryCache, loadDiscovery } from "./discovery.ts";
 import { verifyFederatedIdToken } from "./verify.ts";
 import { decideLink } from "./link.ts";
-import { callbackUri, consumeState, safeRedirectTo } from "./request.ts";
+import {
+  bindingCookieName,
+  bindingMatches,
+  callbackUri,
+  consumeState,
+  isSecureRequest,
+  readBindingCookie,
+  safeRedirectTo,
+} from "./request.ts";
 import type { ProviderConfig, UpstreamIdentity } from "./types.ts";
 
 Deno.test("federationEnabled is off unless explicitly enabled", () => {
@@ -57,6 +65,7 @@ const payload = {
   redirectTo: "/atlas/",
   nonce: "n-1",
   verifier: "v-1",
+  bind: "YmluZGluZy1oYXNo",
   exp: 2_000_000_000,
 };
 
@@ -413,13 +422,31 @@ Deno.test("callback URI falls back to the forwarded origin", () => {
     callbackUri(
       { headers: { "x-forwarded-proto": "https, http", "x-forwarded-host": "trex.test" } },
       "/trex",
-      undefined,
+      // Explicit rather than omitted: the parameter default reads
+      // TREX_FEDERATION_REDIRECT_URI, so leaving it out makes this test pass or
+      // fail depending on the developer's environment.
+      "",
     ),
     "https://trex.test/trex/auth/v1/callback",
   );
   assertEquals(
-    callbackUri({ headers: { host: "trex.test" } }, "", undefined),
+    callbackUri({ headers: { host: "trex.test" } }, "", ""),
     "https://trex.test/auth/v1/callback",
+  );
+  // A plain-HTTP deployment with no proxy header must not claim https: the
+  // provider would reject a redirect_uri it never registered.
+  assertEquals(
+    callbackUri({ protocol: "http", headers: { host: "localhost:33001" } }, "/trex", ""),
+    "http://localhost:33001/trex/auth/v1/callback",
+  );
+  // A proxy header still wins over the connection's own protocol.
+  assertEquals(
+    callbackUri(
+      { protocol: "http", headers: { "x-forwarded-proto": "https", host: "trex.test" } },
+      "/trex",
+      "",
+    ),
+    "https://trex.test/trex/auth/v1/callback",
   );
 });
 
@@ -434,4 +461,58 @@ Deno.test("consumed states stop being remembered once they expire", () => {
   // Past its own expiry the entry is pruned; verifyState rejects such a state
   // before consumeState is ever reached, so nothing is re-openable in practice.
   assertEquals(consumeState("sig-expiring", 100, 101), true);
+});
+
+Deno.test("a callback carrying the matching binding cookie is accepted", async () => {
+  const value = "browser-binding-value";
+  const bind = await hashBinding(value);
+  assertEquals(await bindingMatches(`__Host-trex_federation=${value}`, bind), true);
+  // The unprefixed name is what a plain-HTTP deployment sets.
+  assertEquals(await bindingMatches(`trex_federation=${value}; other=x`, bind), true);
+});
+
+Deno.test("a callback carrying the wrong binding cookie is refused", async () => {
+  const bind = await hashBinding("browser-binding-value");
+  assertEquals(await bindingMatches("__Host-trex_federation=someone-elses", bind), false);
+  // A near miss must not pass either: the comparison is over the hashes.
+  assertEquals(await bindingMatches("__Host-trex_federation=browser-binding-valuf", bind), false);
+});
+
+// The victim in the login-CSRF attack: the attacker's callback URL opened in a
+// browser that never started a flow, so it holds no cookie at all.
+Deno.test("a callback with no binding cookie is refused", async () => {
+  const bind = await hashBinding("browser-binding-value");
+  assertEquals(await bindingMatches(undefined, bind), false);
+  assertEquals(await bindingMatches("", bind), false);
+  assertEquals(await bindingMatches("unrelated=1", bind), false);
+  // And a state carrying no binding at all can never be satisfied.
+  assertEquals(await bindingMatches("__Host-trex_federation=anything", ""), false);
+});
+
+Deno.test("the binding hash hides the cookie value and is stable", async () => {
+  const hash = await hashBinding("browser-binding-value");
+  assertEquals(hash, await hashBinding("browser-binding-value"));
+  assertNotEquals(hash, await hashBinding("browser-binding-valuf"));
+  assertEquals(hash.includes("browser-binding-value"), false);
+  // base64url: safe to carry in a URL-borne state and to log.
+  assertEquals(/^[A-Za-z0-9_-]+$/.test(hash), true);
+});
+
+Deno.test("the prefixed cookie wins over one an attacker could have written", () => {
+  assertEquals(
+    readBindingCookie("trex_federation=plain; __Host-trex_federation=prefixed"),
+    "prefixed",
+  );
+  assertEquals(readBindingCookie("trex_federation=plain"), "plain");
+  assertEquals(readBindingCookie(undefined), null);
+});
+
+Deno.test("__Host- is used only where the cookie can carry Secure", () => {
+  assertEquals(bindingCookieName(true), "__Host-trex_federation");
+  assertEquals(bindingCookieName(false), "trex_federation");
+  // The third argument is pinned for the same reason callbackUri's is.
+  assertEquals(isSecureRequest({ protocol: "https", headers: {} }, ""), true);
+  assertEquals(isSecureRequest({ headers: { "x-forwarded-proto": "https, http" } }, ""), true);
+  assertEquals(isSecureRequest({ headers: {} }, ""), false);
+  assertEquals(isSecureRequest({ headers: {} }, "1"), true);
 });

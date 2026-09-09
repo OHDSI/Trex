@@ -9,6 +9,16 @@ export interface StatePayload {
   redirectTo: string;
   nonce: string;
   verifier: string;
+  /**
+   * SHA-256 of the browser-binding value held in the federation cookie, which
+   * ties this state to the browser that started the flow. Signing alone does
+   * not do that: a signed state is valid in ANY browser, so an attacker who
+   * starts a flow, authenticates as themselves and then hands the resulting
+   * callback URL to a victim signs that victim into the attacker's account
+   * (login CSRF). The hash rather than the value, so a state that ends up in a
+   * log or a Referer still gives up nothing that would let it be replayed.
+   */
+  bind: string;
   /** Unix seconds. Short — this only has to survive one redirect round trip. */
   exp: number;
 }
@@ -61,12 +71,32 @@ export async function verifyState(
   );
   // Length-independent comparison is unnecessary here (both are fixed-length
   // base64 of a SHA-256 MAC), but constant-time comparison still matters.
-  if (provided.length !== expected.length) throw new Error("state signature is invalid");
-  let diff = 0;
-  for (let i = 0; i < expected.length; i++) diff |= provided.charCodeAt(i) ^ expected.charCodeAt(i);
-  if (diff !== 0) throw new Error("state signature is invalid");
+  if (!constantTimeEquals(provided, expected)) throw new Error("state signature is invalid");
 
   const payload = JSON.parse(decoder.decode(b64urlDecode(body))) as StatePayload;
   if (payload.exp <= now) throw new Error("state has expired");
   return payload;
+}
+
+/**
+ * Compares two same-alphabet strings without leaking where they first differ.
+ * Shared with the browser-binding check, which compares a value an attacker
+ * supplies against one they are trying to guess.
+ */
+export function constantTimeEquals(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/**
+ * The form the browser-binding value takes inside the signed state. A plain
+ * digest, not an HMAC: the state it travels in is already signed, so this only
+ * has to be irreversible, and keeping it keyless means it can be recomputed in
+ * a test without deriving anything.
+ */
+export async function hashBinding(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(value));
+  return b64url(new Uint8Array(digest));
 }

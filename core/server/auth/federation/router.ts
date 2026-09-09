@@ -15,13 +15,21 @@ import { loadDiscovery } from "./discovery.ts";
 import { decideLink } from "./link.ts";
 import { challengeFor, createVerifier } from "./pkce.ts";
 import { findUserIdByEmail, loadProviders, provisionUser, upsertAccount } from "./providers.ts";
-import { callbackUri, consumeState, safeErrorCode, safeRedirectTo } from "./request.ts";
-import { signState, STATE_TTL_SECONDS, stateKey, verifyState } from "./state.ts";
+import {
+  bindingCookieName,
+  bindingMatches,
+  callbackUri,
+  consumeState,
+  isSecureRequest,
+  safeErrorCode,
+  safeRedirectTo,
+} from "./request.ts";
+import { hashBinding, signState, STATE_TTL_SECONDS, stateKey, verifyState } from "./state.ts";
 import { verifyFederatedIdToken } from "./verify.ts";
 
 // Re-exported so these read as one unit from outside; request.ts exists only to
 // keep express out of the unit tests' module graph.
-export { callbackUri, consumeState, safeErrorCode, safeRedirectTo };
+export { bindingMatches, callbackUri, consumeState, safeErrorCode, safeRedirectTo };
 
 // deno-lint-ignore no-explicit-any
 type Req = any;
@@ -51,11 +59,29 @@ export function registerFederationRoutes(
       const doc = await loadDiscovery(provider.discoveryUrl);
       const verifier = createVerifier();
       const nonce = crypto.randomUUID();
+
+      // Ties the flow to this browser (see request.ts). SameSite=Lax rather
+      // than Strict on purpose: the browser reaches /callback through a
+      // top-level cross-site redirect from the identity provider, and a Strict
+      // cookie is withheld on exactly that navigation, which would refuse every
+      // legitimate sign-in. Lax is sent on a top-level cross-site GET, which is
+      // what this is.
+      const binding = `${crypto.randomUUID()}${crypto.randomUUID()}`;
+      const secure = isSecureRequest(req);
+      res.cookie(bindingCookieName(secure), binding, {
+        httpOnly: true,
+        sameSite: "lax",
+        secure,
+        path: "/",
+        maxAge: STATE_TTL_SECONDS * 1000,
+      });
+
       const state = await signState({
         provider: provider.id,
         redirectTo: safeRedirectTo(req.query.redirect_to as string | undefined),
         nonce,
         verifier,
+        bind: await hashBinding(binding),
         exp: Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS,
       }, await stateKey());
 
@@ -100,6 +126,21 @@ export function registerFederationRoutes(
 
       const rawState = String(req.query.state ?? "");
       const state = await verifyState(rawState, await stateKey());
+
+      // Before the token exchange, before any database work: a callback that
+      // did not start in this browser is login CSRF and must cost nothing to
+      // refuse. The cookie is cleared either way — it has served its purpose on
+      // success, and on failure it is not this browser's to keep.
+      const bound = await bindingMatches(req.headers.cookie, state.bind);
+      clearBinding(req, res);
+      if (!bound) {
+        res.status(401).json({
+          error: "invalid_request",
+          error_description: "This sign-in did not start in this browser",
+        });
+        return;
+      }
+
       // Only after the signature and expiry check, so the replay map holds
       // nothing an attacker chose and nothing that outlives its own TTL.
       if (!consumeState(rawState, state.exp)) {
@@ -172,45 +213,60 @@ export function registerFederationRoutes(
         res.status(403).json({ error: "access_denied", error_description: decision.reason });
         return;
       }
-      const userId = decision.action === "link"
-        ? decision.userId
-        : await provisionUser(client, identity);
+      // One transaction for the whole write sequence: provisioning a user and
+      // then failing to write its account row would leave a user who exists,
+      // owns no credential and no upstream link, and cannot sign in by any
+      // route — and whose email would be found by the next flow's
+      // findUserIdByEmail and linked to.
+      let sessionUser;
+      await client.query("BEGIN");
+      try {
+        const userId = decision.action === "link"
+          ? decision.userId
+          : await provisionUser(client, identity);
 
-      await upsertAccount(client, {
-        userId,
-        providerId: provider.id,
-        accountId: identity.sub,
-        accessToken: tokens.access_token,
-        refreshToken: tokens.refresh_token,
-        accessTokenExpiresAt: tokens.expires_in
-          ? new Date(Date.now() + tokens.expires_in * 1000)
-          : undefined,
-        scope: tokens.scope,
-        idToken: tokens.id_token,
-      });
+        await upsertAccount(client, {
+          userId,
+          providerId: provider.id,
+          accountId: identity.sub,
+          accessToken: tokens.access_token,
+          refreshToken: tokens.refresh_token,
+          accessTokenExpiresAt: tokens.expires_in
+            ? new Date(Date.now() + tokens.expires_in * 1000)
+            : undefined,
+          scope: tokens.scope,
+          idToken: tokens.id_token,
+        });
 
-      // Parity with the native grants, which stamp this on every successful
-      // login; without it a federated user never records a sign-in.
-      await client.query(
-        `UPDATE trexdb."user" SET last_sign_in_at = NOW() WHERE id = $1`,
-        [userId],
-      );
+        // Parity with the native grants, which stamp this on every successful
+        // login; without it a federated user never records a sign-in.
+        await client.query(
+          `UPDATE trexdb."user" SET last_sign_in_at = NOW() WHERE id = $1`,
+          [userId],
+        );
 
-      // The columns createTokenResponse's DbUser needs, named rather than
-      // SELECT *: the session it signs is built out of this row.
-      const { rows } = await client.query(
-        `SELECT id, name, email, image, role, banned, "emailVerified", email_confirmed_at,
-                last_sign_in_at, "mustChangePassword", user_metadata, app_metadata,
-                password_hash, "createdAt", "updatedAt"
-           FROM trexdb."user" WHERE id = $1 AND "deletedAt" IS NULL`,
-        [userId],
-      );
-      if (!rows.length) throw new Error("federated user vanished between link and session");
+        // The columns createTokenResponse's DbUser needs, named rather than
+        // SELECT *: the session it signs is built out of this row.
+        const { rows } = await client.query(
+          `SELECT id, name, email, image, role, banned, "emailVerified", email_confirmed_at,
+                  last_sign_in_at, "mustChangePassword", user_metadata, app_metadata,
+                  password_hash, "createdAt", "updatedAt"
+             FROM trexdb."user" WHERE id = $1 AND "deletedAt" IS NULL`,
+          [userId],
+        );
+        if (!rows.length) throw new Error("federated user vanished between link and session");
+        sessionUser = rows[0];
+        await client.query("COMMIT");
+      } catch (err) {
+        // A rollback that itself fails must not replace the real error.
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+      }
 
       // Issue exactly the session the password grant issues: it sets the
       // sb-access-token cookie the OIDC provider reads and returns its body
       // rather than writing one, so the redirect below is what the browser gets.
-      await createTokenResponse(rows[0], undefined, res);
+      await createTokenResponse(sessionUser, undefined, res);
       // Signed, so already safe; re-checked because the cost is nil and this is
       // the one redirect an attacker would want to reach.
       res.redirect(302, safeRedirectTo(state.redirectTo));
@@ -232,4 +288,23 @@ export function registerFederationRoutes(
 
   app.use(`${basePath}/auth/v1`, router);
   console.log(`Federation endpoints mounted on ${basePath}/auth/v1/{authorize,callback}`);
+}
+
+/**
+ * Clears the browser-binding cookie. Both names, because a deployment can
+ * change its mind about HTTPS between the two legs of one flow and a stale
+ * cookie under the other name would then outlive the sign-in it belonged to.
+ */
+function clearBinding(req: Req, res: Res): void {
+  const secure = isSecureRequest(req);
+  for (const name of [bindingCookieName(true), bindingCookieName(false)]) {
+    res.clearCookie(name, {
+      httpOnly: true,
+      sameSite: "lax",
+      // The prefixed name is only ever valid with Secure; the plain one takes
+      // whatever this request is, matching how it was set.
+      secure: name.startsWith("__Host-") ? true : secure,
+      path: "/",
+    });
+  }
 }
