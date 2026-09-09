@@ -10,7 +10,7 @@ import {
 import { hashPassword, verifyPassword } from "./password.ts";
 import { authLimiter, apiLimiter } from "../middleware/rate-limit.ts";
 import { isRefreshTokenExpired } from "./refresh-token-ttl.ts";
-import { loadProviders } from "./federation/providers.ts";
+import { loadExternalProviders } from "./settings-providers.ts";
 
 const router = Router();
 router.use(express.json());
@@ -787,10 +787,9 @@ router.get("/settings", apiLimiter, async (_req, res) => {
 
     // Providers come from sso_provider so a client can discover what is
     // actually configured, rather than a fixed list that is wrong either way.
-    const external: Record<string, boolean> = { email: true };
-    for (const id of (await loadProviders(pool)).keys()) {
-      external[id] = true;
-    }
+    // Failure (missing table, DB hiccup) falls back to email-only inside
+    // loadExternalProviders rather than 500ing this endpoint.
+    const external = await loadExternalProviders(pool);
 
     res.json({
       external,
