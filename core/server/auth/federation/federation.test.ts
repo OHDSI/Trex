@@ -6,6 +6,7 @@ import { challengeFor, createVerifier } from "./pkce.ts";
 import { clearDiscoveryCache, loadDiscovery } from "./discovery.ts";
 import { verifyFederatedIdToken } from "./verify.ts";
 import { decideLink } from "./link.ts";
+import { callbackUri, consumeState, safeRedirectTo } from "./request.ts";
 import type { ProviderConfig, UpstreamIdentity } from "./types.ts";
 
 Deno.test("federationEnabled is off unless explicitly enabled", () => {
@@ -367,4 +368,70 @@ Deno.test("verified email, no user, auto-provision on provisions", () => {
     decideLink(identity(true), provider({ autoProvision: true }), null),
     { action: "provision" },
   );
+});
+
+// ── Federation RP routes (router.ts) ────────────────────────────────────────
+
+Deno.test("redirect_to accepts same-origin paths", () => {
+  assertEquals(safeRedirectTo("/atlas/"), "/atlas/");
+  assertEquals(safeRedirectTo("/d2e/portal?x=1"), "/d2e/portal?x=1");
+});
+
+Deno.test("redirect_to rejects absolute URLs and protocol-relative ones", () => {
+  assertEquals(safeRedirectTo("https://evil.test/x"), "/");
+  assertEquals(safeRedirectTo("//evil.test/x"), "/");
+  assertEquals(safeRedirectTo("javascript:alert(1)"), "/");
+});
+
+Deno.test("redirect_to falls back when absent or malformed", () => {
+  assertEquals(safeRedirectTo(undefined), "/");
+  assertEquals(safeRedirectTo(""), "/");
+  // A repeated query parameter arrives as an array, whatever the cast claims.
+  assertEquals(safeRedirectTo(["/a", "/b"] as unknown as string), "/");
+});
+
+// Browsers normalise a backslash to a slash in the authority position, so
+// "/\evil.test" is protocol-relative in practice even though it is not "//".
+// Control characters are stripped before parsing, which re-forms "//host" out
+// of something that passed a naive prefix check.
+Deno.test("redirect_to rejects backslash and control-character smuggling", () => {
+  assertEquals(safeRedirectTo("/\\evil.test/x"), "/");
+  assertEquals(safeRedirectTo("/\t/evil.test/x"), "/");
+  assertEquals(safeRedirectTo("/\n/evil.test"), "/");
+});
+
+Deno.test("callback URI prefers explicit configuration over request headers", () => {
+  const req = { headers: { "x-forwarded-proto": "http", host: "internal:33001" } };
+  assertEquals(
+    callbackUri(req, "/trex", "https://trex.example/trex/auth/v1/callback"),
+    "https://trex.example/trex/auth/v1/callback",
+  );
+});
+
+Deno.test("callback URI falls back to the forwarded origin", () => {
+  assertEquals(
+    callbackUri(
+      { headers: { "x-forwarded-proto": "https, http", "x-forwarded-host": "trex.test" } },
+      "/trex",
+      undefined,
+    ),
+    "https://trex.test/trex/auth/v1/callback",
+  );
+  assertEquals(
+    callbackUri({ headers: { host: "trex.test" } }, "", undefined),
+    "https://trex.test/auth/v1/callback",
+  );
+});
+
+Deno.test("a state is accepted once and refused on replay", () => {
+  assertEquals(consumeState("sig-once", 100, 10), true);
+  assertEquals(consumeState("sig-once", 100, 11), false);
+  assertEquals(consumeState("sig-once", 100, 12), false);
+});
+
+Deno.test("consumed states stop being remembered once they expire", () => {
+  assertEquals(consumeState("sig-expiring", 100, 10), true);
+  // Past its own expiry the entry is pruned; verifyState rejects such a state
+  // before consumeState is ever reached, so nothing is re-openable in practice.
+  assertEquals(consumeState("sig-expiring", 100, 101), true);
 });

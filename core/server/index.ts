@@ -27,6 +27,7 @@ import { nativeIdpEnabled } from "./auth/native-idp.ts";
 import { rolesRouter } from "./auth/roles-api.ts";
 import { oidcProviderEnabled, registerOidcRoutes } from "./auth/oidc/router.ts";
 import { seedClientFromEnv } from "./auth/oidc/seed.ts";
+import { registerFederationRoutes } from "./auth/federation/router.ts";
 import { getActiveSigningKey } from "./auth/oidc/keys.ts";
 import { fnmap } from "./plugin/function.ts";
 import { apiLimiter } from "./middleware/rate-limit.ts";
@@ -159,6 +160,14 @@ app.get(`${BASE_PATH}/api/web-config`, apiLimiter, (_req, res) => {
   const navExtra = mergeNav(collectNavEntries(Plugins.activeRegistry), envExtra);
   res.json({ navExtra });
 });
+
+// Federation relying-party endpoints (/auth/v1/authorize, /auth/v1/callback).
+// Off unless TREX_FEDERATION_ENABLED is set, and mounted BEFORE the native IdP
+// block below on purpose: when the native IdP is disabled that block installs a
+// catch-all 403 across the whole of `${BASE_PATH}/auth/v1`, which would swallow
+// these two routes — and a deployment that federates is exactly the one that
+// turns the native IdP off.
+registerFederationRoutes(app, BASE_PATH, pool);
 
 // Mount the GoTrue-compatible native auth router — but only when the native IDP
 // is explicitly enabled. Disabled by default so a deployment fronted by an

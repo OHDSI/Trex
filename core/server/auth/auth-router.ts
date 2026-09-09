@@ -60,7 +60,9 @@ function toGoTrueUser(u: DbUser) {
   };
 }
 
-async function createTokenResponse(user: DbUser, sessionId?: string, res?: any) {
+// Exported for the federation callback, which finishes an upstream sign-in by
+// issuing the very same session this grant issues.
+export async function createTokenResponse(user: DbUser, sessionId?: string, res?: any) {
   const sid = sessionId || crypto.randomUUID();
   const accessToken = await signAccessToken(
     {

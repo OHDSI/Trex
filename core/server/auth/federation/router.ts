@@ -1,0 +1,235 @@
+// The federation relying-party endpoints.
+//
+// These are NOT the OIDC provider's /authorize (that lives under
+// `${BASE_PATH}/oidc` and faces the other way, serving relying parties such as
+// WebAPI). These send the browser OUT to an upstream identity provider and
+// receive it back, then issue exactly the session the native password grant
+// issues — so from the moment /callback finishes the request is
+// indistinguishable from a native login, and neither the OIDC provider nor any
+// relying party needs to know federation exists.
+import { Router } from "express";
+import { authLimiter } from "../../middleware/rate-limit.ts";
+import { createTokenResponse } from "../auth-router.ts";
+import { applyClaimMap, federationEnabled } from "./config.ts";
+import { loadDiscovery } from "./discovery.ts";
+import { decideLink } from "./link.ts";
+import { challengeFor, createVerifier } from "./pkce.ts";
+import { findUserIdByEmail, loadProviders, provisionUser, upsertAccount } from "./providers.ts";
+import { callbackUri, consumeState, safeErrorCode, safeRedirectTo } from "./request.ts";
+import { signState, STATE_TTL_SECONDS, stateKey, verifyState } from "./state.ts";
+import { verifyFederatedIdToken } from "./verify.ts";
+
+// Re-exported so these read as one unit from outside; request.ts exists only to
+// keep express out of the unit tests' module graph.
+export { callbackUri, consumeState, safeErrorCode, safeRedirectTo };
+
+// deno-lint-ignore no-explicit-any
+type Req = any;
+// deno-lint-ignore no-explicit-any
+type Res = any;
+
+export function registerFederationRoutes(
+  // deno-lint-ignore no-explicit-any
+  app: any,
+  basePath: string,
+  // deno-lint-ignore no-explicit-any
+  pool: any,
+): void {
+  if (!federationEnabled()) return;
+  const router = Router();
+
+  router.get("/authorize", authLimiter, async (req: Req, res: Res) => {
+    let client;
+    try {
+      client = await pool.connect();
+      const providers = await loadProviders(client);
+      const provider = providers.get(String(req.query.provider ?? ""));
+      if (!provider) {
+        res.status(400).json({ error: "invalid_request", error_description: "Unknown provider" });
+        return;
+      }
+      const doc = await loadDiscovery(provider.discoveryUrl);
+      const verifier = createVerifier();
+      const nonce = crypto.randomUUID();
+      const state = await signState({
+        provider: provider.id,
+        redirectTo: safeRedirectTo(req.query.redirect_to as string | undefined),
+        nonce,
+        verifier,
+        exp: Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS,
+      }, await stateKey());
+
+      const url = new URL(doc.authorization_endpoint);
+      url.searchParams.set("response_type", "code");
+      url.searchParams.set("client_id", provider.clientId);
+      url.searchParams.set("redirect_uri", callbackUri(req, basePath));
+      url.searchParams.set("scope", provider.scopes);
+      url.searchParams.set("state", state);
+      url.searchParams.set("nonce", nonce);
+      url.searchParams.set("code_challenge", await challengeFor(verifier));
+      url.searchParams.set("code_challenge_method", "S256");
+      res.redirect(302, url.toString());
+    } catch (err) {
+      // The detail stays in the log. Anything thrown here — a discovery fetch,
+      // a database error, a key derivation — can name internal hosts or
+      // configuration, and this response goes straight to a browser.
+      console.error("[federation] /authorize failed:", err);
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: "server_error",
+          error_description: "Federated sign-in could not be started",
+        });
+      }
+    } finally {
+      client?.release();
+    }
+  });
+
+  router.get("/callback", authLimiter, async (req: Req, res: Res) => {
+    let client;
+    try {
+      // The upstream declined (consent refused, and so on). Say so without
+      // reflecting whatever text it chose to put in error_description.
+      if (req.query.error) {
+        res.status(401).json({
+          error: safeErrorCode(req.query.error),
+          error_description: "The identity provider refused the sign-in",
+        });
+        return;
+      }
+
+      const rawState = String(req.query.state ?? "");
+      const state = await verifyState(rawState, await stateKey());
+      // Only after the signature and expiry check, so the replay map holds
+      // nothing an attacker chose and nothing that outlives its own TTL.
+      if (!consumeState(rawState, state.exp)) {
+        res.status(401).json({
+          error: "invalid_request",
+          error_description: "This sign-in has already been completed",
+        });
+        return;
+      }
+
+      client = await pool.connect();
+      const providers = await loadProviders(client);
+      const provider = providers.get(state.provider);
+      if (!provider) {
+        res.status(400).json({ error: "invalid_request", error_description: "Unknown provider" });
+        return;
+      }
+      const doc = await loadDiscovery(provider.discoveryUrl);
+
+      const form = new URLSearchParams({
+        grant_type: "authorization_code",
+        code: String(req.query.code ?? ""),
+        // Must be byte-identical to the one /authorize sent, hence the same
+        // function rather than a second copy of the string.
+        redirect_uri: callbackUri(req, basePath),
+        client_id: provider.clientId,
+        code_verifier: state.verifier,
+      });
+      // client_secret_post. A provider registered as a public client has no
+      // secret and authenticates with PKCE alone, so an absent one is omitted
+      // rather than sent as "".
+      if (provider.clientSecret) form.set("client_secret", provider.clientSecret);
+
+      const tokenRes = await fetch(doc.token_endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Accept": "application/json",
+        },
+        body: form,
+      });
+      if (!tokenRes.ok) {
+        // The upstream body goes to the log only: it commonly echoes the
+        // request, client_id included, and is not ours to show a browser.
+        const detail = await tokenRes.text().catch(() => "");
+        console.error(
+          `[federation] token exchange with ${provider.id} failed: ${tokenRes.status} ${detail}`,
+        );
+        res.status(401).json({
+          error: "invalid_grant",
+          error_description: "Upstream token exchange failed",
+        });
+        return;
+      }
+      const tokens = await tokenRes.json();
+      if (typeof tokens.id_token !== "string") {
+        throw new Error(`upstream ${provider.id} returned no id_token`);
+      }
+      const claims = await verifyFederatedIdToken(tokens.id_token, {
+        doc,
+        clientId: provider.clientId,
+        nonce: state.nonce,
+      });
+      const identity = applyClaimMap(claims, provider.claimMap);
+
+      const existing = await findUserIdByEmail(client, identity.email);
+      const decision = decideLink(identity, provider, existing);
+      if (decision.action === "refuse") {
+        // decideLink's reasons are trex's own fixed codes, not upstream text.
+        res.status(403).json({ error: "access_denied", error_description: decision.reason });
+        return;
+      }
+      const userId = decision.action === "link"
+        ? decision.userId
+        : await provisionUser(client, identity);
+
+      await upsertAccount(client, {
+        userId,
+        providerId: provider.id,
+        accountId: identity.sub,
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        accessTokenExpiresAt: tokens.expires_in
+          ? new Date(Date.now() + tokens.expires_in * 1000)
+          : undefined,
+        scope: tokens.scope,
+        idToken: tokens.id_token,
+      });
+
+      // Parity with the native grants, which stamp this on every successful
+      // login; without it a federated user never records a sign-in.
+      await client.query(
+        `UPDATE trexdb."user" SET last_sign_in_at = NOW() WHERE id = $1`,
+        [userId],
+      );
+
+      // The columns createTokenResponse's DbUser needs, named rather than
+      // SELECT *: the session it signs is built out of this row.
+      const { rows } = await client.query(
+        `SELECT id, name, email, image, role, banned, "emailVerified", email_confirmed_at,
+                last_sign_in_at, "mustChangePassword", user_metadata, app_metadata,
+                password_hash, "createdAt", "updatedAt"
+           FROM trexdb."user" WHERE id = $1 AND "deletedAt" IS NULL`,
+        [userId],
+      );
+      if (!rows.length) throw new Error("federated user vanished between link and session");
+
+      // Issue exactly the session the password grant issues: it sets the
+      // sb-access-token cookie the OIDC provider reads and returns its body
+      // rather than writing one, so the redirect below is what the browser gets.
+      await createTokenResponse(rows[0], undefined, res);
+      // Signed, so already safe; re-checked because the cost is nil and this is
+      // the one redirect an attacker would want to reach.
+      res.redirect(302, safeRedirectTo(state.redirectTo));
+    } catch (err) {
+      // Same rule as /authorize: an upstream URL, a JWKS failure or a database
+      // message must not reach the browser. One generic code covers every
+      // failure of the exchange, and the detail goes to the log.
+      console.error("[federation] /callback failed:", err);
+      if (!res.headersSent) {
+        res.status(401).json({
+          error: "invalid_request",
+          error_description: "Federated sign-in failed",
+        });
+      }
+    } finally {
+      client?.release();
+    }
+  });
+
+  app.use(`${basePath}/auth/v1`, router);
+  console.log(`Federation endpoints mounted on ${basePath}/auth/v1/{authorize,callback}`);
+}
