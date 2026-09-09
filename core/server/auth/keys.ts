@@ -51,8 +51,10 @@ export function getRootKey(): Uint8Array {
 /** Test-only. Drops the cached root so a new TREX_ROOT_KEY env value is honored. */
 export function _resetRootKeyCache(): void { _cached = null; }
 
-export async function deriveSubkey(label: SubkeyLabel): Promise<Uint8Array> {
-  const root = getRootKey();
+export async function deriveSubkey(
+  label: SubkeyLabel,
+  root: Uint8Array = getRootKey(),
+): Promise<Uint8Array> {
   const material = await crypto.subtle.importKey(
     "raw", root.buffer as ArrayBuffer, "HKDF", false, ["deriveBits"],
   );
@@ -67,8 +69,14 @@ export async function deriveSubkey(label: SubkeyLabel): Promise<Uint8Array> {
 /**
  * Convenience: derive and base64-encode (no padding, no url-safe substitution)
  * for use as a string secret passed to libraries that expect raw text.
+ *
+ * `root`, when given, is used as raw key material in place of `TREX_ROOT_KEY`
+ * (encoded as UTF-8, not base64-decoded, and not subject to the 32-byte
+ * minimum enforced on the env-sourced root) — this lets callers such as tests
+ * derive subkeys without any environment setup. Omitting it preserves the
+ * existing behaviour of reading and validating `TREX_ROOT_KEY`.
  */
-export async function deriveSubkeyBase64(label: SubkeyLabel): Promise<string> {
-  const bytes = await deriveSubkey(label);
+export async function deriveSubkeyBase64(label: SubkeyLabel, root?: string): Promise<string> {
+  const bytes = await deriveSubkey(label, root !== undefined ? encoder.encode(root) : undefined);
   return btoa(Array.from(bytes, (b) => String.fromCharCode(b)).join("")).replace(/=+$/, "");
 }
