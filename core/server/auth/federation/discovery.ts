@@ -13,6 +13,10 @@ export interface DiscoveryDoc {
 
 export const DISCOVERY_TTL_SECONDS = 3600;
 
+// Asymmetric algorithms suitable for verifying id_tokens against a JWKS.
+// Excludes "none" (algorithm-confusion vector) and HS* (symmetric, inappropriate for third-party verification).
+const ALLOWED_SIGNING_ALGS = new Set(["RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512"]);
+
 const cache = new Map<string, { doc: DiscoveryDoc; fetchedAt: number }>();
 
 export function clearDiscoveryCache(): void {
@@ -42,6 +46,15 @@ export async function loadDiscovery(
     doc.id_token_signing_alg_values_supported = ["RS256"];
   }
 
-  cache.set(url, { doc, fetchedAt: now });
+  // Filter to asymmetric algorithms only. Rejects "none" (algorithm-confusion vector) and
+  // HS* (symmetric, unsuitable for verifying third-party signatures against their JWKS).
+  const filtered = doc.id_token_signing_alg_values_supported.filter(alg => ALLOWED_SIGNING_ALGS.has(alg));
+  if (filtered.length === 0) {
+    throw new Error(`discovery document lists no usable signing algorithms; advertised: ${doc.id_token_signing_alg_values_supported.join(", ")}`);
+  }
+  doc.id_token_signing_alg_values_supported = filtered;
+
+  // Freeze to prevent mutations from poisoning the cache.
+  cache.set(url, { doc: Object.freeze(doc), fetchedAt: now });
   return doc;
 }

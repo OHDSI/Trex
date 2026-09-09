@@ -161,3 +161,85 @@ Deno.test("a discovery document missing required endpoints is rejected", async (
     "incomplete",
   );
 });
+
+Deno.test("discovery cache is frozen; mutations do not affect subsequent fetches", async () => {
+  clearDiscoveryCache();
+  const c = { n: 0 };
+  const url = "https://logto.test/.well-known/openid-configuration";
+  const doc1 = await loadDiscovery(url, stubFetch(DOC, c), 1000);
+  // Attempt to mutate the returned document; frozen objects reject mutations silently or throw
+  try {
+    (doc1 as unknown as Record<string, unknown>).token_endpoint = "https://evil.test/token";
+  } catch {
+    // Expected: frozen object
+  }
+  // Fetch again from cache; returns the same frozen instance
+  const doc2 = await loadDiscovery(url, stubFetch(DOC, c), 1001);
+  // The cached value is unchanged
+  assertEquals(doc2.token_endpoint, "https://logto.test/oidc/token");
+  assertEquals(c.n, 1);
+});
+
+Deno.test("discovery cache expires at exactly the TTL boundary", async () => {
+  clearDiscoveryCache();
+  const c = { n: 0 };
+  const url = "https://logto.test/.well-known/openid-configuration";
+  await loadDiscovery(url, stubFetch(DOC, c), 1000);
+  // Fetch exactly DISCOVERY_TTL_SECONDS later (3600); should treat as expired
+  await loadDiscovery(url, stubFetch(DOC, c), 1000 + 3600);
+  assertEquals(c.n, 2);
+});
+
+Deno.test("discovery filters algorithms to asymmetric only", async () => {
+  clearDiscoveryCache();
+  const c = { n: 0 };
+  const doc = await loadDiscovery(
+    "https://logto.test/.well-known/openid-configuration",
+    stubFetch({
+      ...DOC,
+      id_token_signing_alg_values_supported: ["RS256", "none"],
+    }, c),
+  );
+  assertEquals(doc.id_token_signing_alg_values_supported, ["RS256"]);
+});
+
+Deno.test("discovery rejects a document advertising no usable signing algorithms", async () => {
+  clearDiscoveryCache();
+  const c = { n: 0 };
+  await assertRejects(
+    () => loadDiscovery(
+      "https://logto.test/.well-known/openid-configuration",
+      stubFetch({ ...DOC, id_token_signing_alg_values_supported: ["none"] }, c),
+    ),
+    Error,
+    "no usable signing algorithms",
+  );
+});
+
+Deno.test("discovery rejects HS256 as unsuitable for JWKS verification", async () => {
+  clearDiscoveryCache();
+  const c = { n: 0 };
+  await assertRejects(
+    () => loadDiscovery(
+      "https://logto.test/.well-known/openid-configuration",
+      stubFetch({ ...DOC, id_token_signing_alg_values_supported: ["HS256"] }, c),
+    ),
+    Error,
+    "no usable signing algorithms",
+  );
+});
+
+Deno.test("discovery defaults absent id_token_signing_alg_values_supported to RS256", async () => {
+  clearDiscoveryCache();
+  const c = { n: 0 };
+  const doc = await loadDiscovery(
+    "https://logto.test/.well-known/openid-configuration",
+    stubFetch({
+      issuer: "https://logto.test/oidc",
+      authorization_endpoint: "https://logto.test/oidc/auth",
+      token_endpoint: "https://logto.test/oidc/token",
+      jwks_uri: "https://logto.test/oidc/jwks",
+    }, c),
+  );
+  assertEquals(doc.id_token_signing_alg_values_supported, ["RS256"]);
+});
