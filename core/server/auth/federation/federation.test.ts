@@ -5,6 +5,8 @@ import { signState, stateKey, verifyState } from "./state.ts";
 import { challengeFor, createVerifier } from "./pkce.ts";
 import { clearDiscoveryCache, loadDiscovery } from "./discovery.ts";
 import { verifyFederatedIdToken } from "./verify.ts";
+import { decideLink } from "./link.ts";
+import type { ProviderConfig, UpstreamIdentity } from "./types.ts";
 
 Deno.test("federationEnabled is off unless explicitly enabled", () => {
   assertEquals(federationEnabled(undefined), false);
@@ -328,5 +330,41 @@ Deno.test("an algorithm the provider does not advertise is rejected", async () =
     () => verifyFederatedIdToken(token, { doc, clientId: "d2e-client", nonce: "n-1", jwks }),
     Error,
     "alg",
+  );
+});
+
+const provider = (over: Partial<ProviderConfig> = {}): ProviderConfig => ({
+  id: "logto", displayName: "Logto", clientId: "c", clientSecret: "s",
+  issuer: "https://logto.test/oidc", discoveryUrl: "https://logto.test/d",
+  scopes: "openid profile email", claimMap: {}, groupsSource: "none",
+  groupsClaim: null, linkPolicy: "verified_email", autoProvision: false, ...over,
+});
+const identity = (verified: boolean): UpstreamIdentity => ({
+  sub: "s-1", email: "jo@example.test", emailVerified: verified,
+});
+
+Deno.test("verified email + existing user links", () => {
+  assertEquals(decideLink(identity(true), provider(), "u-1"), { action: "link", userId: "u-1" });
+});
+
+Deno.test("unverified email never links, even to an existing user", () => {
+  const d = decideLink(identity(false), provider(), "u-1");
+  assertEquals(d.action, "refuse");
+});
+
+Deno.test("unverified email is refused even when auto-provision is on", () => {
+  const d = decideLink(identity(false), provider({ autoProvision: true }), null);
+  assertEquals(d.action, "refuse");
+});
+
+Deno.test("verified email, no user, auto-provision off is refused", () => {
+  const d = decideLink(identity(true), provider(), null);
+  assertEquals(d.action, "refuse");
+});
+
+Deno.test("verified email, no user, auto-provision on provisions", () => {
+  assertEquals(
+    decideLink(identity(true), provider({ autoProvision: true }), null),
+    { action: "provision" },
   );
 });
