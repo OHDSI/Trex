@@ -2,6 +2,7 @@ import { assertEquals, assertNotEquals, assertRejects, assertThrows } from "jsr:
 import { applyClaimMap, federationEnabled } from "./config.ts";
 import { signState, stateKey, verifyState } from "./state.ts";
 import { challengeFor, createVerifier } from "./pkce.ts";
+import { clearDiscoveryCache, loadDiscovery } from "./discovery.ts";
 
 Deno.test("federationEnabled is off unless explicitly enabled", () => {
   assertEquals(federationEnabled(undefined), false);
@@ -108,4 +109,55 @@ Deno.test("challenge is the base64url SHA-256 of the verifier", async () => {
   // Known vector from RFC 7636 appendix B.
   const challenge = await challengeFor("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
   assertEquals(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+});
+
+const DOC = {
+  issuer: "https://logto.test/oidc",
+  authorization_endpoint: "https://logto.test/oidc/auth",
+  token_endpoint: "https://logto.test/oidc/token",
+  jwks_uri: "https://logto.test/oidc/jwks",
+  id_token_signing_alg_values_supported: ["RS256", "ES384"],
+};
+
+function stubFetch(doc: unknown, counter: { n: number }): typeof fetch {
+  return ((_url: string) => {
+    counter.n++;
+    return Promise.resolve(new Response(JSON.stringify(doc), { status: 200 }));
+  }) as unknown as typeof fetch;
+}
+
+Deno.test("discovery document is fetched and parsed", async () => {
+  clearDiscoveryCache();
+  const c = { n: 0 };
+  const doc = await loadDiscovery("https://logto.test/.well-known/openid-configuration", stubFetch(DOC, c));
+  assertEquals(doc.token_endpoint, "https://logto.test/oidc/token");
+  assertEquals(c.n, 1);
+});
+
+Deno.test("discovery document is cached within its TTL", async () => {
+  clearDiscoveryCache();
+  const c = { n: 0 };
+  const url = "https://logto.test/.well-known/openid-configuration";
+  await loadDiscovery(url, stubFetch(DOC, c), 1000);
+  await loadDiscovery(url, stubFetch(DOC, c), 1060);
+  assertEquals(c.n, 1);
+});
+
+Deno.test("discovery cache expires", async () => {
+  clearDiscoveryCache();
+  const c = { n: 0 };
+  const url = "https://logto.test/.well-known/openid-configuration";
+  await loadDiscovery(url, stubFetch(DOC, c), 1000);
+  await loadDiscovery(url, stubFetch(DOC, c), 1000 + 3601);
+  assertEquals(c.n, 2);
+});
+
+Deno.test("a discovery document missing required endpoints is rejected", async () => {
+  clearDiscoveryCache();
+  const c = { n: 0 };
+  await assertRejects(
+    () => loadDiscovery("https://x.test/d", stubFetch({ issuer: "https://x.test" }, c)),
+    Error,
+    "incomplete",
+  );
 });
