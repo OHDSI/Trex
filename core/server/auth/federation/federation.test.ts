@@ -7,6 +7,7 @@ import { clearDiscoveryCache, loadDiscovery } from "./discovery.ts";
 import { verifyFederatedIdToken } from "./verify.ts";
 import { decideLink } from "./link.ts";
 import {
+  _resetInsecureBindingWarning,
   bindingCookieName,
   bindingMatches,
   callbackUri,
@@ -14,6 +15,7 @@ import {
   isSecureRequest,
   readBindingCookie,
   safeRedirectTo,
+  warnIfInsecureBinding,
 } from "./request.ts";
 import type { ProviderConfig, UpstreamIdentity } from "./types.ts";
 
@@ -466,27 +468,52 @@ Deno.test("consumed states stop being remembered once they expire", () => {
 Deno.test("a callback carrying the matching binding cookie is accepted", async () => {
   const value = "browser-binding-value";
   const bind = await hashBinding(value);
-  assertEquals(await bindingMatches(`__Host-trex_federation=${value}`, bind), true);
-  // The unprefixed name is what a plain-HTTP deployment sets.
-  assertEquals(await bindingMatches(`trex_federation=${value}; other=x`, bind), true);
+  assertEquals(await bindingMatches(`__Host-trex_federation=${value}`, bind, true), true);
+  // The unprefixed name is what a plain-HTTP deployment sets, and is accepted
+  // only on a non-secure request — local sign-in has to keep working.
+  assertEquals(await bindingMatches(`trex_federation=${value}; other=x`, bind, false), true);
 });
 
 Deno.test("a callback carrying the wrong binding cookie is refused", async () => {
   const bind = await hashBinding("browser-binding-value");
-  assertEquals(await bindingMatches("__Host-trex_federation=someone-elses", bind), false);
+  assertEquals(await bindingMatches("__Host-trex_federation=someone-elses", bind, true), false);
   // A near miss must not pass either: the comparison is over the hashes.
-  assertEquals(await bindingMatches("__Host-trex_federation=browser-binding-valuf", bind), false);
+  assertEquals(
+    await bindingMatches("__Host-trex_federation=browser-binding-valuf", bind, true),
+    false,
+  );
 });
 
 // The victim in the login-CSRF attack: the attacker's callback URL opened in a
 // browser that never started a flow, so it holds no cookie at all.
 Deno.test("a callback with no binding cookie is refused", async () => {
   const bind = await hashBinding("browser-binding-value");
-  assertEquals(await bindingMatches(undefined, bind), false);
-  assertEquals(await bindingMatches("", bind), false);
-  assertEquals(await bindingMatches("unrelated=1", bind), false);
+  assertEquals(await bindingMatches(undefined, bind, true), false);
+  assertEquals(await bindingMatches("", bind, true), false);
+  assertEquals(await bindingMatches("unrelated=1", bind, true), false);
   // And a state carrying no binding at all can never be satisfied.
-  assertEquals(await bindingMatches("__Host-trex_federation=anything", ""), false);
+  assertEquals(await bindingMatches("__Host-trex_federation=anything", "", true), false);
+});
+
+// The cookie-shadowing attack the __Host- prefix exists to stop. The victim
+// holds no prefixed cookie — they never started a flow — so falling back to the
+// unprefixed name would hand the whole binding back: the attacker reads their
+// own binding value off their own Set-Cookie, plants it under the weak name
+// from a sibling subdomain or over plaintext for any sibling host, and the
+// victim's browser presents a value that matches.
+Deno.test("on a secure request the unprefixed cookie never satisfies the binding", async () => {
+  const value = "browser-binding-value";
+  const bind = await hashBinding(value);
+  assertEquals(await bindingMatches(`trex_federation=${value}`, bind, true), false);
+  // Not even alongside a prefixed cookie that does not match.
+  assertEquals(
+    await bindingMatches(`__Host-trex_federation=other; trex_federation=${value}`, bind, true),
+    false,
+  );
+  // And the converse, so a plain-HTTP deployment still signs in: there the
+  // unprefixed name is the one that was set, and the prefixed one is ignored.
+  assertEquals(await bindingMatches(`trex_federation=${value}`, bind, false), true);
+  assertEquals(await bindingMatches(`__Host-trex_federation=${value}`, bind, false), false);
 });
 
 Deno.test("the binding hash hides the cookie value and is stable", async () => {
@@ -498,13 +525,33 @@ Deno.test("the binding hash hides the cookie value and is stable", async () => {
   assertEquals(/^[A-Za-z0-9_-]+$/.test(hash), true);
 });
 
-Deno.test("the prefixed cookie wins over one an attacker could have written", () => {
-  assertEquals(
-    readBindingCookie("trex_federation=plain; __Host-trex_federation=prefixed"),
-    "prefixed",
-  );
-  assertEquals(readBindingCookie("trex_federation=plain"), "plain");
-  assertEquals(readBindingCookie(undefined), null);
+Deno.test("only the name this request's scheme mandates is read", () => {
+  const header = "trex_federation=plain; __Host-trex_federation=prefixed";
+  assertEquals(readBindingCookie(header, true), "prefixed");
+  assertEquals(readBindingCookie(header, false), "plain");
+  // A secure request sees nothing at all when only the weak name is present.
+  assertEquals(readBindingCookie("trex_federation=plain", true), null);
+  assertEquals(readBindingCookie("__Host-trex_federation=prefixed", false), null);
+  assertEquals(readBindingCookie(undefined, true), null);
+});
+
+Deno.test("the weak cookie name is announced once, not per request", () => {
+  _resetInsecureBindingWarning();
+  const said: string[] = [];
+  warnIfInsecureBinding(false, (m) => said.push(m));
+  warnIfInsecureBinding(false, (m) => said.push(m));
+  warnIfInsecureBinding(false, (m) => said.push(m));
+  assertEquals(said.length, 1);
+  // An operator has to be able to act on it, so it names the remedy.
+  assertEquals(said[0].includes("TREX_FORCE_SECURE_COOKIES=1"), true);
+  assertEquals(said[0].includes("X-Forwarded-Proto"), true);
+
+  // A secure deployment hears nothing.
+  _resetInsecureBindingWarning();
+  const quiet: string[] = [];
+  warnIfInsecureBinding(true, (m) => quiet.push(m));
+  assertEquals(quiet.length, 0);
+  _resetInsecureBindingWarning();
 });
 
 Deno.test("__Host- is used only where the cookie can carry Secure", () => {

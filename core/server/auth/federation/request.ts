@@ -123,8 +123,18 @@ export function safeErrorCode(raw: unknown): string {
  * Secure and Path=/, so no sibling subdomain and no plaintext response can set
  * or overwrite it. A browser rejects it outright without Secure, though, which
  * over plain HTTP would leave the cookie unset and every sign-in refused — so a
- * non-HTTPS deployment falls back to the unprefixed name. Both names are read
- * back, so a flow that starts on one and returns on the other still completes.
+ * non-HTTPS deployment falls back to the unprefixed name.
+ *
+ * Exactly ONE name is read per request, chosen by the request's own scheme.
+ * Accepting either would hand back the whole attack the prefix exists to stop:
+ * a victim who never started a flow holds no `__Host-` cookie, so precedence
+ * between the names never comes into play. The attacker reads the binding value
+ * off their own Set-Cookie (HttpOnly hides nothing from the party the server
+ * sent it to), plants it under the unprefixed name from a sibling subdomain or
+ * by injecting over plaintext for any sibling host — neither of which touches
+ * this origin — and the victim's browser then presents a value that matches.
+ * On a secure request the unprefixed name is therefore ignored even when the
+ * prefixed one is absent.
  */
 export const BINDING_COOKIE = "__Host-trex_federation";
 export const BINDING_COOKIE_INSECURE = "trex_federation";
@@ -151,9 +161,12 @@ export function bindingCookieName(secure: boolean): string {
   return secure ? BINDING_COOKIE : BINDING_COOKIE_INSECURE;
 }
 
-/** The prefixed cookie wins: it is the one an attacker cannot have written. */
-export function readBindingCookie(header: string | undefined): string | null {
-  return readCookie(header, BINDING_COOKIE) ?? readCookie(header, BINDING_COOKIE_INSECURE);
+/**
+ * The binding cookie under the one name this request's scheme mandates. No
+ * fallback to the other name: see the note on BINDING_COOKIE above.
+ */
+export function readBindingCookie(header: string | undefined, secure: boolean): string | null {
+  return readCookie(header, bindingCookieName(secure));
 }
 
 /**
@@ -164,8 +177,44 @@ export function readBindingCookie(header: string | undefined): string | null {
 export async function bindingMatches(
   cookieHeader: string | undefined,
   bind: string,
+  secure: boolean,
 ): Promise<boolean> {
-  const presented = readBindingCookie(cookieHeader);
+  const presented = readBindingCookie(cookieHeader, secure);
   if (!presented || typeof bind !== "string" || bind.length === 0) return false;
   return constantTimeEquals(await hashBinding(presented), bind);
+}
+
+/**
+ * Says once, loudly, that this deployment is issuing the weak cookie name.
+ *
+ * The usual cause is not plain HTTP on purpose but a TLS-terminating proxy that
+ * forwards no X-Forwarded-Proto: trex then sees http, picks the unprefixed
+ * name, and the browser-binding cookie becomes one a sibling host can write.
+ * Nothing about the request looks wrong, so without this it is silent.
+ *
+ * Once rather than per request: an operator reads the first one and a warning
+ * on every sign-in only trains them to filter it out.
+ */
+let warnedInsecureBinding = false;
+
+export function warnIfInsecureBinding(
+  secure: boolean,
+  log: (msg: string) => void = console.warn,
+): void {
+  if (secure || warnedInsecureBinding) return;
+  warnedInsecureBinding = true;
+  log(
+    "[federation] WARNING: serving /authorize over a non-secure request, so the " +
+    `browser-binding cookie is set as "${BINDING_COOKIE_INSECURE}" instead of ` +
+    `"${BINDING_COOKIE}". Without the __Host- prefix a sibling subdomain (or ` +
+    "anyone injecting over plaintext for one) can write that cookie, which " +
+    "weakens the login-CSRF protection on the federation callback. If TLS is " +
+    "terminated by a proxy, have it send X-Forwarded-Proto, or set " +
+    "TREX_FORCE_SECURE_COOKIES=1.",
+  );
+}
+
+/** Test-only. Lets a test observe the once-only behaviour more than once. */
+export function _resetInsecureBindingWarning(): void {
+  warnedInsecureBinding = false;
 }

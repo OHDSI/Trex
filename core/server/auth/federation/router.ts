@@ -23,6 +23,7 @@ import {
   isSecureRequest,
   safeErrorCode,
   safeRedirectTo,
+  warnIfInsecureBinding,
 } from "./request.ts";
 import { hashBinding, signState, STATE_TTL_SECONDS, stateKey, verifyState } from "./state.ts";
 import { verifyFederatedIdToken } from "./verify.ts";
@@ -68,6 +69,10 @@ export function registerFederationRoutes(
       // what this is.
       const binding = `${crypto.randomUUID()}${crypto.randomUUID()}`;
       const secure = isSecureRequest(req);
+      // A deployment that lands here is weakening its own binding, usually by
+      // accident (a TLS-terminating proxy sending no X-Forwarded-Proto), and
+      // nothing else about the request would show it.
+      warnIfInsecureBinding(secure);
       res.cookie(bindingCookieName(secure), binding, {
         httpOnly: true,
         sameSite: "lax",
@@ -131,7 +136,10 @@ export function registerFederationRoutes(
       // did not start in this browser is login CSRF and must cost nothing to
       // refuse. The cookie is cleared either way — it has served its purpose on
       // success, and on failure it is not this browser's to keep.
-      const bound = await bindingMatches(req.headers.cookie, state.bind);
+      // The name is chosen by THIS request's scheme, and only that name is
+      // read: on HTTPS an unprefixed cookie is ignored even when no prefixed
+      // one is present, or a sibling host could plant the value it needs.
+      const bound = await bindingMatches(req.headers.cookie, state.bind, isSecureRequest(req));
       clearBinding(req, res);
       if (!bound) {
         res.status(401).json({
