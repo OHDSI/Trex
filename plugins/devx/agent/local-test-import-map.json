@@ -2,6 +2,7 @@
   "imports": {
     "eve": "../../../core/server/agents/eve-shim/mod.ts",
     "eve/tools": "../../../core/server/agents/eve-shim/tools.ts",
+    "eve/core/": "../../../core/server/agents/",
     "edn-data": "npm:edn-data@^1"
   }
 }

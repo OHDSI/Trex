@@ -4,7 +4,7 @@
 // (claude-code) loop, which runs neither hook. Read from the session row,
 // NEVER from ctx.metadata — a restriction the model can restate per turn is
 // one it can widen.
-import type { QueryFn } from "../../../../core/server/agents/eve-shim/types.ts";
+import type { QueryFn } from "eve/core/eve-shim/types.ts";
 import { getRunWorktreePath } from "../../functions/tools/workspace.ts";
 
 export interface SessionScope {

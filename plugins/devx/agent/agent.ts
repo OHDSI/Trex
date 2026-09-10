@@ -10,7 +10,7 @@ import type { HookCtx, ModelSpec } from "eve";
 // (see eve-shim/mod.ts) — this is erased at build/runtime, same posture as
 // lib/context.ts's own core-relative type-only imports (see that file's
 // header comment for why this doesn't create a real dependency on core).
-import type { AgentEngine, ToolDef } from "../../../core/server/agents/eve-shim/types.ts";
+import type { AgentEngine, ToolDef } from "eve/core/eve-shim/types.ts";
 import { createSidecarEngine } from "./lib/sidecar_engine.ts";
 import { readMetadata } from "./lib/context.ts";
 import { loadSkillsForPrompt } from "../functions/skills/resolver.ts";
@@ -25,7 +25,7 @@ import { materializeAttachments, renderAttachmentBlock } from "../functions/atta
 import { DEFERRED_TOOLS } from "./lib/deferred_tools.ts";
 // Real runtime import (not type-only), same posture as dynamic-tools.ts's
 // core/server/agents/connections/mcp.ts import above it.
-import { capHookOutput } from "../../../core/server/agents/service/context/hook-output.ts";
+import { capHookOutput } from "eve/core/service/context/hook-output.ts";
 import { acceptDeclaredWorkspace, loadSessionScope, peekSessionScope, peekSessionScopeForCtx } from "./lib/session_scope.ts";
 
 // Port of functions/tools/registry.ts's buildToolSet PLAN_MODE_TOOLS
