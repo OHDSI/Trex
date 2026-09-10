@@ -82,6 +82,9 @@ async function buildFlowCredentials(): Promise<any[]> {
                     'userScope', dc."userScope",
                     'serviceScope', dc."serviceScope"
                   )
+                  -- Deterministic so the pick below is reproducible rather
+                  -- than whatever order the join happened to produce.
+                  ORDER BY dc."updatedAt" DESC NULLS LAST, dc.username
                 ) FILTER (WHERE dc.id IS NOT NULL),
                 '[]'::json
               ) AS credentials
@@ -93,8 +96,26 @@ async function buildFlowCredentials(): Promise<any[]> {
     const out: any[] = [];
     for (const row of r.rows) {
       const creds: any[] = row.credentials ?? [];
-      const read = creds.find((c) => c.userScope === "Read");
-      const admin = creds.find((c) => c.userScope === "Admin");
+      // Several rows may share a userScope: the key is (databaseId, username,
+      // userScope), so a database can legitimately carry more than one Read or
+      // Admin user, and a stray registration adds one silently. json_agg above
+      // is unordered, so `find` would then pick an arbitrary row -- the flow
+      // block gets the wrong service user, every query fails with an
+      // authorization error, and nothing says which credential was used.
+      // Take the most recently updated, matching routes.ts and boot.ts, and say
+      // so when the choice was ambiguous.
+      const pick = (scope: string) => {
+        const matches = creds.filter((c) => c.userScope === scope);
+        if (matches.length > 1) {
+          const names = matches.map((c) => c.username).sort().join(", ");
+          console.warn(
+            `[d2e-compat] database ${row.id} has ${matches.length} ${scope} credentials (${names}); using the most recently updated. Remove the duplicates -- the others are silently unused.`,
+          );
+        }
+        return matches[0];
+      };
+      const read = pick("Read");
+      const admin = pick("Admin");
       const extra = row.extra ?? {};
       out.push({
         readUser: read ? read.username : null,
