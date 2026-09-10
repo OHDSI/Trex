@@ -86,6 +86,57 @@ jobs:
       - id: shuffle
         run: echo "random_runner=$(shuf -e ubuntu-22.04 ubuntu-24.04 | head -n 1)" >> "$GITHUB_OUTPUT"
 
+  runtime-lockfile-guard:
+    # plugins/runtime/Cargo.lock is the lockfile cargo actually resolves for the
+    # trexas package; the submodule's own lockfile is inert because the submodule
+    # crates enter as path dependencies. The two therefore drift silently — a
+    # stale rev here once shipped a runtime built against an older fork commit and
+    # cost a full CI cycle to spot. Fail fast instead, before any 26-minute build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out only the runtime submodule
+        run: git submodule update --init --depth 1 plugins/runtime/trex-runtime
+      - name: Compare git revisions pinned by both lockfiles
+        run: |
+          outer=plugins/runtime/Cargo.lock
+          inner=plugins/runtime/trex-runtime/Cargo.lock
+          for f in "$outer" "$inner"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::$f is missing — cannot verify lockfile agreement"
+              exit 1
+            fi
+          done
+          # Every `git+<url>?<ref>#<rev>` source, keyed by repo+ref. Any key both
+          # lockfiles mention must name the same commit.
+          rev_of() {
+            grep -oE 'git\+[^"#]+#[0-9a-f]{40}' "$1" | sort -u
+          }
+          rev_of "$outer" > /tmp/outer.revs
+          rev_of "$inner" > /tmp/inner.revs
+          if [ ! -s /tmp/outer.revs ]; then
+            echo "::error::no git sources found in $outer — the check would pass vacuously"
+            exit 1
+          fi
+          status=0
+          while IFS= read -r o; do
+            key=${o%%#*}
+            i=$(grep -F "$key#" /tmp/inner.revs | head -1) || true
+            [ -n "$i" ] || continue
+            if [ "$o" != "$i" ]; then
+              echo "::error::lockfile drift for ${key#git+}"
+              echo "  $outer: ${o##*#}"
+              echo "  $inner: ${i##*#}"
+              status=1
+            fi
+          done < /tmp/outer.revs
+          if [ "$status" -ne 0 ]; then
+            echo "Re-resolve the outer lockfile so it matches the submodule, e.g.:"
+            echo "  cargo update -p <crate> --manifest-path plugins/runtime/Cargo.toml"
+            exit 1
+          fi
+          echo "OK: $(wc -l < /tmp/outer.revs) git source(s) in $outer, all shared revisions agree with the submodule"
+
   aithon:
     needs: [pick_runner]
     if: |
@@ -564,9 +615,20 @@ jobs:
         run: |
           cd ${{ matrix.PKGPATH }}
           TARBALL=$(ls -t *.tgz | head -1)
+          # Builds that are not a tag or a workflow_dispatch release stamp a
+          # prerelease version (see "Update version"). npm 10 published those to
+          # `latest` by default, but npm >= 11.6 refuses a prerelease without an
+          # explicit dist-tag, so the studio leg — the only one pinned to 11.6 —
+          # failed on develop while every other plugin succeeded. Pass the tag
+          # explicitly so the result no longer depends on the npm in PATH.
+          VERSION=$(node -p "require('./package.json').version")
+          case "$VERSION" in
+            *-*) TAG_ARGS=(--tag latest) ;;
+            *)   TAG_ARGS=() ;;
+          esac
           # Publish the already-built tarball — prepack already ran during npm pack.
           # Use --ignore-scripts to avoid re-running prepack (and re-building) here.
-          npm publish "$TARBALL" --ignore-scripts
+          npm publish "$TARBALL" --ignore-scripts "${TAG_ARGS[@]}"
       - name: Extract extension name
         id: extname
         run: echo "name=$(basename ${{ matrix.PKGPATH }})" >> "$GITHUB_OUTPUT"
