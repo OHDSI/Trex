@@ -153,14 +153,22 @@ export async function verifyState(
 }
 
 /**
- * Compares two same-alphabet strings without leaking where they first differ.
- * Shared with the browser-binding check, which compares a value an attacker
- * supplies against one they are trying to guess.
+ * Compares two same-alphabet strings without leaking where they first
+ * differ. Shared with the browser-binding check, which compares a value an
+ * attacker supplies against one they are trying to guess.
+ *
+ * `expected` must be the value this server just computed (an HMAC or a
+ * SHA-256 digest, both fixed-length base64url) — callers keep it in that
+ * position at both call sites. The loop below is bounded by
+ * `expected.length`, never by `candidate.length`, so an attacker who
+ * controls `candidate` cannot influence how much work the comparison does:
+ * a `candidate` longer than `expected` is refused up front without the
+ * loop ever running.
  */
-export function constantTimeEquals(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
+export function constantTimeEquals(candidate: string, expected: string): boolean {
+  if (candidate.length !== expected.length) return false;
   let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  for (let i = 0; i < expected.length; i++) diff |= candidate.charCodeAt(i) ^ expected.charCodeAt(i);
   return diff === 0;
 }
 

@@ -181,7 +181,11 @@ export async function bindingMatches(
 ): Promise<boolean> {
   const presented = readBindingCookie(cookieHeader, secure);
   if (!presented || typeof bind !== "string" || bind.length === 0) return false;
-  return constantTimeEquals(await hashBinding(presented), bind);
+  // `bind` came off the decrypted, HMAC-verified state — trustworthy by the
+  // time it reaches here, but constantTimeEquals's `expected` slot is
+  // reserved for the value computed fresh right at the call site, so the
+  // freshly hashed cookie goes there and `bind` is the `candidate`.
+  return constantTimeEquals(bind, await hashBinding(presented));
 }
 
 /**
