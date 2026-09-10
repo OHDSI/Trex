@@ -6,6 +6,7 @@ import { challengeFor, createVerifier } from "./pkce.ts";
 import { clearDiscoveryCache, loadDiscovery } from "./discovery.ts";
 import { verifyFederatedIdToken } from "./verify.ts";
 import { decideLink } from "./link.ts";
+import { resolveGroups } from "./groups.ts";
 import { findLinkedUser, resolveFederatedUser } from "./providers.ts";
 import {
   _resetInsecureBindingWarning,
@@ -380,6 +381,58 @@ Deno.test("verified email, no user, auto-provision on provisions", () => {
     decideLink(identity(true), provider({ autoProvision: true }), null),
     { action: "provision" },
   );
+});
+
+// ── Group resolution (groups.ts) ────────────────────────────────────────────
+
+Deno.test("groups_source 'claim' reads the configured claim, raw", () => {
+  const p = provider({ groupsSource: "claim", groupsClaim: "roles" });
+  // Order, case and duplicates are the upstream's to decide; d2e maps them.
+  assertEquals(
+    resolveGroups({ roles: ["Zeta", "alpha", "Zeta"] }, p),
+    ["Zeta", "alpha", "Zeta"],
+  );
+});
+
+Deno.test("groups_claim names an arbitrary claim, not just 'groups'", () => {
+  const claims = { groups: ["wrong"], "http://schemas.test/groups": ["right"] };
+  assertEquals(
+    resolveGroups(claims, provider({
+      groupsSource: "claim",
+      groupsClaim: "http://schemas.test/groups",
+    })),
+    ["right"],
+  );
+});
+
+Deno.test("an absent, empty or non-array claim yields no groups, never an error", () => {
+  const p = provider({ groupsSource: "claim", groupsClaim: "groups" });
+  assertEquals(resolveGroups({}, p), []);
+  assertEquals(resolveGroups({ groups: [] }, p), []);
+  assertEquals(resolveGroups({ groups: null }, p), []);
+  assertEquals(resolveGroups({ groups: "admins" }, p), []);
+  assertEquals(resolveGroups({ groups: { a: 1 } }, p), []);
+  // Configured for claims but with no claim named: nothing to read.
+  assertEquals(
+    resolveGroups({ groups: ["a"] }, provider({ groupsSource: "claim", groupsClaim: null })),
+    [],
+  );
+});
+
+// A partial list that looks complete is worse than none: the relying party
+// would map it to roles and silently under-grant.
+Deno.test("an array with non-string members is treated as no group list", () => {
+  const p = provider({ groupsSource: "claim", groupsClaim: "groups" });
+  assertEquals(resolveGroups({ groups: ["a", 2] }, p), []);
+  assertEquals(resolveGroups({ groups: [{ id: "a" }] }, p), []);
+});
+
+Deno.test("'none' and (for now) 'graph' resolve to no groups", () => {
+  const claims = { groups: ["admins"] };
+  assertEquals(resolveGroups(claims, provider({ groupsSource: "none", groupsClaim: "groups" })), []);
+  // The MS Graph resolver is a later phase; until it exists this must be an
+  // empty list rather than the id_token claim it would not have used anyway.
+  assertEquals(resolveGroups(claims, provider({ groupsSource: "graph", groupsClaim: "groups" })), []);
 });
 
 // ── Identity resolution (providers.ts) ──────────────────────────────────────

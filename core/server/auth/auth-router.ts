@@ -11,6 +11,7 @@ import { hashPassword, verifyPassword } from "./password.ts";
 import { authLimiter, apiLimiter } from "../middleware/rate-limit.ts";
 import { isRefreshTokenExpired } from "./refresh-token-ttl.ts";
 import { loadExternalProviders } from "./settings-providers.ts";
+import { IDP_METADATA_KEY } from "./oidc/claims.ts";
 
 const router = Router();
 router.use(express.json());
@@ -300,15 +301,24 @@ async function handlePasswordGrant(req: any, res: any) {
       await migratePasswordHash(user.id, newHash);
     }
 
-    const response = await createTokenResponse(user, undefined, res);
-
-    // Update last_sign_in_at
+    // This session is a native one, so any federation block left by an earlier
+    // federated sign-in stops describing it. Dropped rather than left to age:
+    // the OIDC provider reads that block to decide whether to emit
+    // idp_provider/idp_groups, and a stale one would have trex assert that a
+    // password session came from an upstream. Also stamps last_sign_in_at,
+    // which this grant already owed the row.
     await pool.query(
-      `UPDATE trexdb."user" SET last_sign_in_at = NOW() WHERE id = $1`,
-      [user.id],
+      `UPDATE trexdb."user"
+          SET last_sign_in_at = NOW(),
+              app_metadata = COALESCE(app_metadata, '{}'::jsonb) - $2::text
+        WHERE id = $1`,
+      [user.id, IDP_METADATA_KEY],
     );
+    // The row was read before that UPDATE, so the response body would still
+    // carry the block that no longer exists.
+    if (user.app_metadata) delete user.app_metadata[IDP_METADATA_KEY];
 
-    res.json(response);
+    res.json(await createTokenResponse(user, undefined, res));
   } catch (err) {
     console.error("[auth] password grant error:", err);
     res.status(500).json({ error: "server_error", error_description: "Internal server error" });

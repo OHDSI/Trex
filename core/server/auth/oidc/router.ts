@@ -24,6 +24,7 @@ import {
   verifyClientSecret,
 } from "./clients.ts";
 import { consumeCode, issueCode, verifyPkce } from "./codes.ts";
+import { federationFromAppMetadata } from "./claims.ts";
 import {
   DEFAULT_ID_TOKEN_TTL_SECONDS,
   type IdTokenUser,
@@ -44,11 +45,17 @@ interface DbUserRow {
   name: string | null;
   role: string;
   emailVerified: boolean | null;
+  app_metadata: unknown;
 }
 
 async function fetchUser(id: string): Promise<IdTokenUser | null> {
   const result = await pool.query<DbUserRow>(
-    `SELECT id, email, name, role, "emailVerified"
+    // app_metadata carries the federation block a federated sign-in wrote
+    // (see federation/router.ts). It is the only route by which this side of
+    // trex learns which upstream a session came from: fetchUser is reached
+    // from three places — /authorize's code exchange, the refresh grant and
+    // /userinfo — and all three have a user id and nothing else.
+    `SELECT id, email, name, role, "emailVerified", app_metadata
        FROM trexdb."user" WHERE id = $1 AND "deletedAt" IS NULL`,
     [id],
   );
@@ -71,6 +78,9 @@ async function fetchUser(id: string): Promise<IdTokenUser | null> {
     role: row.role,
     appRoles: roles.rows.map((r) => r.name),
     emailVerified: Boolean(row.emailVerified),
+    // Absent for a native sign-in, which is what keeps buildIdTokenClaims from
+    // emitting idp_provider/idp_groups for one.
+    ...federationFromAppMetadata(row.app_metadata),
   };
 }
 
@@ -145,12 +155,18 @@ export function registerOidcRoutes(basePath: string) {
       grant_types_supported: ["authorization_code", "client_credentials", "refresh_token"],
       subject_types_supported: ["public"],
       id_token_signing_alg_values_supported: ["RS256"],
-      scopes_supported: ["openid", "profile", "email"],
+      // idp_groups is the federation claims contract (spec: "Groups and the
+      // claims contract"). Advertising it does not grant it: grantedScopes()
+      // still narrows every request to the client's own allowed_scopes, so a
+      // relying party receives group data only once an operator has added
+      // 'idp_groups' to that client's oidc_client.allowed_scopes.
+      scopes_supported: ["openid", "profile", "email", "idp_groups"],
       token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"],
       code_challenge_methods_supported: ["S256"],
       claims_supported: [
         "iss", "sub", "aud", "exp", "iat", "auth_time", "nonce",
         "email", "email_verified", "name", "trex_role",
+        "idp_groups", "idp_provider",
       ],
     });
   });
@@ -353,8 +369,11 @@ export function registerOidcRoutes(basePath: string) {
 
         // The original grant's scopes are not stored, so the renewal carries what
         // this client is allowed to ask for. Narrowing to "openid" instead would
-        // silently drop the email and profile claims the relying party had.
-        const refreshedScopes = grantedScopes(client, "openid profile email");
+        // silently drop the email and profile claims the relying party had —
+        // and idp_groups is listed for the same reason: a client allowed group
+        // data must not lose it on the first refresh, which would leave the
+        // relying party's role mapping working until the token turned over.
+        const refreshedScopes = grantedScopes(client, "openid profile email idp_groups");
         const renewed = await signIdToken(refreshed, {
           issuer,
           audience: client.clientId,

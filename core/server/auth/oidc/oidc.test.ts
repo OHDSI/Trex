@@ -8,7 +8,11 @@ import {
   type OidcClient,
   verifyPkce,
 } from "./policy.ts";
-import { buildIdTokenClaims } from "./claims.ts";
+import {
+  buildIdTokenClaims,
+  federationFromAppMetadata,
+  IDP_METADATA_KEY,
+} from "./claims.ts";
 import {
   issuerUrl,
   loginUrl,
@@ -343,4 +347,112 @@ Deno.test("a native login emits no idp claims even under the scope", () => {
     { issuer: "https://trex.test", audience: "atlas", scopes: ["openid", "idp_groups"] },
   );
   assertEquals(claims.idp_groups, undefined);
+});
+
+// ── The federated-session end of the claims contract ────────────────────────
+//
+// The producer is federation/router.ts, which writes trexdb."user".app_metadata
+// inside the callback transaction; the consumer is oidc/router.ts's fetchUser,
+// which spreads federationFromAppMetadata(row.app_metadata) into the
+// IdTokenUser it returns. These exercise the join between the two without a
+// database: the value written on one side, read on the other, and carried into
+// the issued claims.
+
+/** The literal JSONB a federated sign-in leaves behind, for a claim-sourced provider. */
+const federatedAppMetadata = (provider: string, groups: string[]) => ({
+  provider: "email",
+  providers: ["email"],
+  [IDP_METADATA_KEY]: { provider, groups },
+});
+
+Deno.test("a federated session's app_metadata becomes idp claims under the scope", () => {
+  const user = {
+    id: "u-1",
+    email: "jo@example.test",
+    role: "user",
+    appRoles: ["RESEARCHER"],
+    // Exactly what fetchUser does with the row it read.
+    ...federationFromAppMetadata(federatedAppMetadata("logto", ["admins", "Trial-Ops"])),
+  };
+  assertEquals(user.idpProvider, "logto");
+  assertEquals(user.idpGroups, ["admins", "Trial-Ops"]);
+
+  const claims = buildIdTokenClaims(user, {
+    issuer: "https://trex.test",
+    audience: "atlas",
+    scopes: ["openid", "idp_groups"],
+  });
+  // Raw and in the order the upstream stated them: not sorted, not folded.
+  assertEquals(claims.idp_groups, ["admins", "Trial-Ops"]);
+  assertEquals(claims.idp_provider, "logto");
+});
+
+Deno.test("a federated session with no groups still names its provider", () => {
+  const claims = buildIdTokenClaims(
+    {
+      id: "u-1",
+      email: "jo@example.test",
+      role: "user",
+      appRoles: [],
+      ...federationFromAppMetadata(federatedAppMetadata("physionet", [])),
+    },
+    { issuer: "https://trex.test", audience: "atlas", scopes: ["openid", "idp_groups"] },
+  );
+  assertEquals(claims.idp_groups, []);
+  assertEquals(claims.idp_provider, "physionet");
+});
+
+Deno.test("a native session's app_metadata yields no idp fields at all", () => {
+  const native = { provider: "email", providers: ["email"], trex_role: "user" };
+  assertEquals(federationFromAppMetadata(native), {});
+
+  const claims = buildIdTokenClaims(
+    {
+      id: "u-1",
+      email: "jo@example.test",
+      role: "user",
+      appRoles: [],
+      ...federationFromAppMetadata(native),
+    },
+    { issuer: "https://trex.test", audience: "atlas", scopes: ["openid", "idp_groups"] },
+  );
+  assertEquals(claims.idp_groups, undefined);
+  assertEquals(claims.idp_provider, undefined);
+});
+
+// app_metadata is a free-form JSONB column that long predates federation.
+Deno.test("a malformed federation block degrades to a native session", () => {
+  assertEquals(federationFromAppMetadata(null), {});
+  assertEquals(federationFromAppMetadata(undefined), {});
+  assertEquals(federationFromAppMetadata("nonsense"), {});
+  assertEquals(federationFromAppMetadata({ [IDP_METADATA_KEY]: "logto" }), {});
+  assertEquals(federationFromAppMetadata({ [IDP_METADATA_KEY]: { groups: ["a"] } }), {});
+  assertEquals(federationFromAppMetadata({ [IDP_METADATA_KEY]: { provider: "" } }), {});
+  // A provider with an unusable group list is still a federated session; it
+  // simply asserts no groups, rather than being demoted to a native one.
+  assertEquals(
+    federationFromAppMetadata({ [IDP_METADATA_KEY]: { provider: "logto" } }),
+    { idpProvider: "logto", idpGroups: [] },
+  );
+  assertEquals(
+    federationFromAppMetadata({ [IDP_METADATA_KEY]: { provider: "logto", groups: [1, 2] } }),
+    { idpProvider: "logto", idpGroups: [] },
+  );
+});
+
+// grantedScopes is what stands between "advertised" and "granted": a client
+// that has not been given the scope cannot obtain group data by asking.
+Deno.test("idp_groups is grantable only to a client that allows it", () => {
+  assertEquals(grantedScopes(client, "openid idp_groups"), ["openid"]);
+  const allowed: OidcClient = {
+    ...client,
+    allowedScopes: [...client.allowedScopes, "idp_groups"],
+  };
+  assertEquals(grantedScopes(allowed, "openid idp_groups"), ["openid", "idp_groups"]);
+  // And the refresh grant asks for it by name, so an allowed client does not
+  // lose its group claims the first time its token turns over.
+  assertEquals(
+    grantedScopes(allowed, "openid profile email idp_groups").includes("idp_groups"),
+    true,
+  );
 });

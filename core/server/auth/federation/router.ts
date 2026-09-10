@@ -10,8 +10,10 @@
 import { Router } from "express";
 import { authLimiter } from "../../middleware/rate-limit.ts";
 import { createTokenResponse } from "../auth-router.ts";
+import { IDP_METADATA_KEY } from "../oidc/claims.ts";
 import { applyClaimMap, federationEnabled } from "./config.ts";
 import { loadDiscovery } from "./discovery.ts";
+import { resolveGroups } from "./groups.ts";
 import { challengeFor, createVerifier } from "./pkce.ts";
 import { loadProviders, provisionUser, resolveFederatedUser, upsertAccount } from "./providers.ts";
 import {
@@ -212,6 +214,9 @@ export function registerFederationRoutes(
         nonce: state.nonce,
       });
       const identity = applyClaimMap(claims, provider.claimMap);
+      // Step 6 of the flow. Read off the validated id_token, so the claim is
+      // one this provider signed; raw, so d2e sees what the upstream said.
+      const groups = resolveGroups(claims, provider);
 
       // Identity first, email second: an upstream subject already linked to a
       // trex user IS that user, whatever address the upstream now asserts.
@@ -246,11 +251,32 @@ export function registerFederationRoutes(
           idToken: tokens.id_token,
         });
 
-        // Parity with the native grants, which stamp this on every successful
-        // login; without it a federated user never records a sign-in.
+        // Two things at once, and both belong to this sign-in.
+        //
+        // last_sign_in_at is parity with the native grants, which stamp it on
+        // every successful login; without it a federated user never records a
+        // sign-in.
+        //
+        // The idp block is how the OIDC provider learns, later and on a
+        // different request, that this user's current session came from an
+        // upstream and which groups it asserted. fetchUser() there is handed
+        // nothing but a user id — no session row, no code record — so the
+        // fact has to be durable and keyed by the user. It is written inside
+        // this transaction with the account row it describes, and dropped
+        // again by a native password sign-in, so it always describes the most
+        // recent sign-in rather than accumulating.
         await client.query(
-          `UPDATE trexdb."user" SET last_sign_in_at = NOW() WHERE id = $1`,
-          [userId],
+          `UPDATE trexdb."user"
+              SET last_sign_in_at = NOW(),
+                  app_metadata = COALESCE(app_metadata, '{}'::jsonb)
+                                 || jsonb_build_object($2::text, $3::jsonb),
+                  "updatedAt" = NOW()
+            WHERE id = $1`,
+          [
+            userId,
+            IDP_METADATA_KEY,
+            JSON.stringify({ provider: provider.id, groups }),
+          ],
         );
 
         // The columns createTokenResponse's DbUser needs, named rather than
