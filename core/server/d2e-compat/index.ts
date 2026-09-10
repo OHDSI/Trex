@@ -61,6 +61,21 @@ export async function runD2eBoot(): Promise<void> {
   }
 }
 
+/** WebAPI security seeding (atlas-db-init). No-op unless D2E_COMPAT.
+ *  Split out of runD2eBoot() because it must run AFTER startNativeWebApi():
+ *  it waits on tables WebAPI's Flyway creates, and index.ts starts WebAPI
+ *  only once the listener is up (see the boot-order contract in boot.ts).
+ *  Guarded like runD2eBoot — seeding must never take the node down. */
+export async function runD2eAtlasDbInit(): Promise<void> {
+  if (!D2E_COMPAT) return;
+  try {
+    const { d2eAtlasDbInit } = await import("./boot.ts");
+    await d2eAtlasDbInit();
+  } catch (e) {
+    console.error("[d2e-compat] atlas-db-init failed (continuing without it):", (e as Error)?.message ?? e);
+  }
+}
+
 /** Mounts d2e-only Express routes. No-op unless D2E_COMPAT. */
 // Awaited so routes are registered before the server starts listening.
 export async function applyD2eCompat(app: Express): Promise<void> {

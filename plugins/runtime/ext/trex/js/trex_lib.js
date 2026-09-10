@@ -1,7 +1,14 @@
+// Imports use absolute `ext:trex/...` specifiers, not relative paths.
+// These modules are registered as `lazy_loaded_esm` and are resolved by
+// deno_core's `LazyEsmModuleLoader`, which calls `resolve_import` directly.
+// Unlike the eager `ExtModuleLoader`, it has no special handling for `ext:`
+// referrers, and `ext:trex/trex_lib.js` is a cannot-be-a-base URL, so a
+// relative specifier fails with "relative URL with a cannot-be-a-base base".
+// Same convention as `ext/node`'s polyfills, which are lazily loaded too.
 import { core } from "ext:core/mod.js";
-import { TrexConnection } from './dbconnection.js';
-import { resolveDialect, resolveFirstPublication } from './db_resolve.js';
-import { buildHanaEvictSessionSql, buildHanaExecuteSql, buildHanaScanSql } from './hana_sql.js';
+import { TrexConnection } from "ext:trex/dbconnection.js";
+import { resolveDialect, resolveFirstPublication } from "ext:trex/db_resolve.js";
+import { buildHanaEvictSessionSql, buildHanaExecuteSql, buildHanaScanSql } from "ext:trex/hana_sql.js";
 
 const ops = core.ops;
 
