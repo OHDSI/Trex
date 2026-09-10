@@ -8,6 +8,9 @@ import type { ProviderConfig, UpstreamIdentity } from "./types.ts";
 export type LinkDecision =
   | { action: "link"; userId: string }
   | { action: "provision" }
+  // Fixed codes, never upstream text: they are returned to a browser.
+  // "upstream_email_unverified" | "no_account" from here, and
+  // "account_disabled" from resolveFederatedUser's existing-link path.
   | { action: "refuse"; reason: string };
 
 export function decideLink(

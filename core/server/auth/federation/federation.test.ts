@@ -6,6 +6,7 @@ import { challengeFor, createVerifier } from "./pkce.ts";
 import { clearDiscoveryCache, loadDiscovery } from "./discovery.ts";
 import { verifyFederatedIdToken } from "./verify.ts";
 import { decideLink } from "./link.ts";
+import { findLinkedUser, resolveFederatedUser } from "./providers.ts";
 import {
   _resetInsecureBindingWarning,
   bindingCookieName,
@@ -378,6 +379,126 @@ Deno.test("verified email, no user, auto-provision on provisions", () => {
   assertEquals(
     decideLink(identity(true), provider({ autoProvision: true }), null),
     { action: "provision" },
+  );
+});
+
+// ── Identity resolution (providers.ts) ──────────────────────────────────────
+
+/**
+ * A pg client stubbed by which statement it is asked to run. Enough to drive
+ * resolveFederatedUser, which is the only place the two lookups are ordered
+ * against each other, without a database.
+ */
+function stubClient(rows: { linked?: unknown[]; byEmail?: unknown[] }) {
+  const seen: string[] = [];
+  return {
+    seen,
+    // deno-lint-ignore no-explicit-any
+    query(sql: string, _params: unknown[]): Promise<any> {
+      // The link lookup joins user, so it must be recognised first.
+      if (sql.includes("FROM trexdb.account a")) {
+        seen.push("link");
+        return Promise.resolve({ rows: rows.linked ?? [] });
+      }
+      if (sql.includes('FROM trexdb."user"')) {
+        seen.push("email");
+        return Promise.resolve({ rows: rows.byEmail ?? [] });
+      }
+      throw new Error(`unexpected query: ${sql}`);
+    },
+  };
+}
+
+Deno.test("an existing link is found and reports whether its user is disabled", async () => {
+  const live = await findLinkedUser(
+    stubClient({ linked: [{ userId: "u-1", disabled: false }] }),
+    "logto",
+    "s-1",
+  );
+  assertEquals(live, { userId: "u-1", disabled: false });
+
+  const banned = await findLinkedUser(
+    stubClient({ linked: [{ userId: "u-1", disabled: true }] }),
+    "logto",
+    "s-1",
+  );
+  assertEquals(banned, { userId: "u-1", disabled: true });
+
+  assertEquals(await findLinkedUser(stubClient({}), "logto", "s-1"), null);
+});
+
+// The upstream changed the address. The link is the identity, so the sign-in
+// lands on the linked user and never looks at whoever now holds that email.
+Deno.test("an existing link wins over a different email", async () => {
+  const client = stubClient({
+    linked: [{ userId: "u-linked", disabled: false }],
+    byEmail: [{ id: "u-someone-else" }],
+  });
+  assertEquals(
+    await resolveFederatedUser(client, provider(), {
+      sub: "s-1",
+      email: "changed@example.test",
+      emailVerified: true,
+    }),
+    { action: "link", userId: "u-linked" },
+  );
+  // Not merely outranked: the email question is never asked.
+  assertEquals(client.seen, ["link"]);
+});
+
+// An unverified upstream email would refuse a *new* link; it is irrelevant to
+// one that already exists, because no linking decision is being made.
+Deno.test("an existing link does not re-ask the verified-email question", async () => {
+  const client = stubClient({ linked: [{ userId: "u-linked", disabled: false }] });
+  assertEquals(
+    await resolveFederatedUser(client, provider(), {
+      sub: "s-1",
+      email: "jo@example.test",
+      emailVerified: false,
+    }),
+    { action: "link", userId: "u-linked" },
+  );
+  assertEquals(client.seen, ["link"]);
+});
+
+Deno.test("an existing link to a disabled user is refused", async () => {
+  const client = stubClient({
+    linked: [{ userId: "u-banned", disabled: true }],
+    // Would be email-linkable if the flow ever fell through to it.
+    byEmail: [{ id: "u-someone-else" }],
+  });
+  const decision = await resolveFederatedUser(client, provider(), identity(true));
+  assertEquals(decision, { action: "refuse", reason: "account_disabled" });
+  // And it stops there rather than falling through to provision or re-link.
+  assertEquals(client.seen, ["link"]);
+});
+
+Deno.test("with no link, a verified email links as before", async () => {
+  const client = stubClient({ byEmail: [{ id: "u-2" }] });
+  assertEquals(
+    await resolveFederatedUser(client, provider(), identity(true)),
+    { action: "link", userId: "u-2" },
+  );
+  assertEquals(client.seen, ["link", "email"]);
+});
+
+Deno.test("with no link and no matching user, the provider's policy decides", async () => {
+  assertEquals(
+    await resolveFederatedUser(stubClient({}), provider(), identity(true)),
+    { action: "refuse", reason: "no_account" },
+  );
+  assertEquals(
+    await resolveFederatedUser(stubClient({}), provider({ autoProvision: true }), identity(true)),
+    { action: "provision" },
+  );
+  // An unverified upstream email still links to nothing.
+  assertEquals(
+    (await resolveFederatedUser(
+      stubClient({ byEmail: [{ id: "u-2" }] }),
+      provider(),
+      identity(false),
+    )).action,
+    "refuse",
   );
 });
 

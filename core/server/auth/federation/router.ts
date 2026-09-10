@@ -12,9 +12,8 @@ import { authLimiter } from "../../middleware/rate-limit.ts";
 import { createTokenResponse } from "../auth-router.ts";
 import { applyClaimMap, federationEnabled } from "./config.ts";
 import { loadDiscovery } from "./discovery.ts";
-import { decideLink } from "./link.ts";
 import { challengeFor, createVerifier } from "./pkce.ts";
-import { findUserIdByEmail, loadProviders, provisionUser, upsertAccount } from "./providers.ts";
+import { loadProviders, provisionUser, resolveFederatedUser, upsertAccount } from "./providers.ts";
 import {
   bindingCookieName,
   bindingMatches,
@@ -214,10 +213,11 @@ export function registerFederationRoutes(
       });
       const identity = applyClaimMap(claims, provider.claimMap);
 
-      const existing = await findUserIdByEmail(client, identity.email);
-      const decision = decideLink(identity, provider, existing);
+      // Identity first, email second: an upstream subject already linked to a
+      // trex user IS that user, whatever address the upstream now asserts.
+      const decision = await resolveFederatedUser(client, provider, identity);
       if (decision.action === "refuse") {
-        // decideLink's reasons are trex's own fixed codes, not upstream text.
+        // The reasons are trex's own fixed codes, not upstream text.
         res.status(403).json({ error: "access_denied", error_description: decision.reason });
         return;
       }
@@ -259,10 +259,16 @@ export function registerFederationRoutes(
           `SELECT id, name, email, image, role, banned, "emailVerified", email_confirmed_at,
                   last_sign_in_at, "mustChangePassword", user_metadata, app_metadata,
                   password_hash, "createdAt", "updatedAt"
-             FROM trexdb."user" WHERE id = $1 AND "deletedAt" IS NULL`,
+             FROM trexdb."user"
+            WHERE id = $1 AND "deletedAt" IS NULL AND banned IS NOT TRUE`,
           [userId],
         );
-        if (!rows.length) throw new Error("federated user vanished between link and session");
+        // Belt and braces on the disabled-user rule: whichever path resolved
+        // the user — an existing link or a fresh email match — no session is
+        // ever built from a row this SELECT would not return.
+        if (!rows.length) {
+          throw new Error("federated user is gone or deactivated between link and session");
+        }
         sessionUser = rows[0];
         await client.query("COMMIT");
       } catch (err) {
