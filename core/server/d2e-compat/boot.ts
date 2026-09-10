@@ -36,9 +36,11 @@
 // index.ts calls, in this order:
 //   1. trex.provision plugins — roles/schemas/grants        (index.ts, FATAL on failure)
 //   2. Plugins.initPlugins()  — plugin init fns + migrations
-//   3. startNativeWebApi()    — WebAPI + its Flyway migrations
-//   4. runD2eBoot()           — this file, incl. Block 9 atlas-db-init (non-fatal)
-// Anything needing webapi.sec_* MUST run in step 4, never as a plugin.
+//   3. runD2eBoot()           — d2eBoot() below, blocks 2-8 (non-fatal)
+//   4. server.listen(), then startNativeWebApi() — WebAPI + its Flyway migrations
+//   5. runD2eAtlasDbInit()    — d2eAtlasDbInit() below, Block 9 (non-fatal)
+// Anything needing webapi.sec_* MUST run in step 5, never in d2eBoot() and never
+// as a plugin: steps 1-3 all complete before WebAPI has created those tables.
 
 import {
   CACHE_DIR,
@@ -353,12 +355,26 @@ export async function d2eBoot(): Promise<void> {
   bootReseedDatabaseCredentials().catch((e) =>
     err(`prefect 'database-credentials' boot re-seed failed: ${(e as Error).message}`)
   );
+}
 
-  // ── Block 9: atlas-db-init ────────────────────────────────────────────────
-  // Replaces d2e's webapi-init container. Runs here (rather than as a plugin
-  // init function or plugin migration) because both of those execute inside
-  // Plugins.initPlugins(), which index.ts calls BEFORE startNativeWebApi() —
-  // so webapi.sec_* does not exist yet at that point.
+// ── Block 9: atlas-db-init ──────────────────────────────────────────────────
+// Replaces d2e's webapi-init container. Deliberately NOT part of d2eBoot():
+// it is the one boot step that reads tables WebAPI's own Flyway creates
+// (webapi.sec_role and friends), and index.ts runs d2eBoot() before it starts
+// WebAPI. Called from d2eBoot() the wait for webapi.sec_role could therefore
+// never succeed on a fresh database — it held the event loop that had yet to
+// launch the process that creates the table, timed out after ~120s, and the
+// stack came up with no admin permissions and no OIDC role map. The visible
+// symptom was WebAPI answering "Access Denied" to SourceService.createSource,
+// which aborts d2e's dataset sync before it triggers the TrexSQL cache build,
+// so the demo setup polls "Cache not ready" until it times out.
+//
+// index.ts therefore calls this AFTER startNativeWebApi(), off the boot path.
+// The wait inside applyAtlasDbInit is what synchronises with Flyway.
+export async function d2eAtlasDbInit(): Promise<void> {
+  const log = (m: string) => console.log(`[d2e-compat] ${m}`);
+  const err = (m: string) => console.error(`[d2e-compat] ${m}`);
+
   try {
     const { applyAtlasDbInit } = await import("./atlas-db-init.ts");
     const dir = Deno.env.get("D2E_ATLAS_DB_INIT_DIR") || "/usr/src/atlas-db-init";

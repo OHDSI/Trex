@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert";
+import { assert, assertEquals } from "jsr:@std/assert";
 import { findPsqlMetaCommands, waitForTables, type TableRef } from "./atlas-db-init.ts";
 
 const TABLES: TableRef[] = [
@@ -134,4 +134,47 @@ Deno.test("logto keeps the full wait, unchanged", () => {
   for (const idp of ["logto", "", undefined, "LOGTO"]) {
     assertEquals(requiredTablesFor(idp), REQUIRED_TABLES, `idp=${idp}`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Boot order (see the contract at the top of boot.ts)
+// ---------------------------------------------------------------------------
+// The seeding waits for webapi.sec_role, a table WebAPI's own Flyway creates.
+// While the call lived in d2eBoot() that wait ran BEFORE index.ts started
+// WebAPI, so on a fresh database it could never be satisfied: it blocked the
+// event loop that had yet to launch the process that creates the table, gave up
+// after ~120s, and the stack came up with no admin permissions and no OIDC
+// external role map. WebAPI then answered "Access Denied" to
+// SourceService.createSource, d2e's dataset sync aborted before it triggered the
+// TrexSQL cache build, and the demo setup polled "Cache not ready" until it
+// timed out. Asserted on the source because the failure is purely one of order.
+const bootSrc = await Deno.readTextFile(new URL("./boot.ts", import.meta.url));
+const serverSrc = await Deno.readTextFile(new URL("../index.ts", import.meta.url));
+
+Deno.test("d2eBoot does not apply atlas-db-init — it runs before WebAPI exists", () => {
+  const bootAt = bootSrc.indexOf("export async function d2eBoot");
+  const blockNineAt = bootSrc.indexOf("// \u2500\u2500 Block 9: atlas-db-init");
+  assert(bootAt !== -1 && blockNineAt > bootAt, "d2eBoot must end before Block 9 begins");
+  assert(
+    bootSrc.includes("export async function d2eAtlasDbInit"),
+    "Block 9 must live in its own exported function",
+  );
+  const d2eBootBody = bootSrc.slice(bootAt, blockNineAt);
+  assert(
+    !d2eBootBody.includes("applyAtlasDbInit"),
+    "atlas-db-init must not run from d2eBoot(); index.ts calls it after startNativeWebApi()",
+  );
+});
+
+Deno.test("index.ts seeds only after startNativeWebApi()", () => {
+  const startedAt = serverSrc.indexOf("startNativeWebApi()");
+  const seededAt = serverSrc.indexOf("runD2eAtlasDbInit()");
+  assert(startedAt !== -1, "index.ts must start the native WebAPI");
+  assert(seededAt !== -1, "index.ts must run atlas-db-init");
+  assert(seededAt > startedAt, "atlas-db-init must be chained after startNativeWebApi()");
+  // ...and never back on the pre-listen boot path, where the same inversion returns.
+  assert(
+    serverSrc.indexOf("await runD2eBoot();") < startedAt,
+    "runD2eBoot() stays ahead of WebAPI; only the seeding moved",
+  );
 });

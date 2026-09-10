@@ -30,7 +30,7 @@ import { seedClientFromEnv } from "./auth/oidc/seed.ts";
 import { getActiveSigningKey } from "./auth/oidc/keys.ts";
 import { fnmap } from "./plugin/function.ts";
 import { apiLimiter } from "./middleware/rate-limit.ts";
-import { applyD2eCompat, applyD2eCompatEarly, assertD2eProvisioned, D2E_COMPAT, runD2eBoot, syncD2ePlugins } from "./d2e-compat/index.ts";
+import { applyD2eCompat, applyD2eCompatEarly, assertD2eProvisioned, D2E_COMPAT, runD2eAtlasDbInit, runD2eBoot, syncD2ePlugins } from "./d2e-compat/index.ts";
 import { parseReadyPort, startBootstrapReadySignal } from "./d2e-compat/bootstrap-ready.ts";
 import { collectProvisionTargets, runProvisionTargets } from "./plugin/provision.ts";
 import { collectNavEntries, mergeNav } from "./plugin/nav.ts";
@@ -1472,7 +1472,18 @@ server.listen(8000, () => {
   // discovery document, and when trex is its own IdP that document is served by
   // this process. Starting it before the listener made the node wait on itself,
   // so WebAPI never launched and the health endpoint never answered.
-  void startNativeWebApi();
+  //
+  // atlas-db-init chains off it rather than running inside runD2eBoot(): the
+  // seeding waits for webapi.sec_role, which WebAPI's Flyway creates. From
+  // runD2eBoot() that wait sits ahead of this line, so on a fresh database it
+  // could never be satisfied — it timed out after ~120s and the stack came up
+  // with no WebAPI admin permissions and no OIDC external role map, which is
+  // what made SourceService.createSource answer "Access Denied" and stranded
+  // d2e's dataset sync before it ever triggered the TrexSQL cache build.
+  void startNativeWebApi()
+    .catch((e) => console.error("[webapi] start failed:", (e as Error)?.message ?? e))
+    .then(() => runD2eAtlasDbInit())
+    .catch((e) => console.error("[d2e-compat] atlas-db-init failed:", (e as Error)?.message ?? e));
 });
 
 // Start the native realtime replication service without blocking boot — a

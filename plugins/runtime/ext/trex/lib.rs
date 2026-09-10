@@ -1333,8 +1333,28 @@ deno_core::extension!(
         op_req_respond,
         op_register_static_route
     ],
-    esm_entry_point = "ext:trex/trex_lib.js",
-    esm = [
+    // The trex JS surface is reached exclusively through
+    // `ops.op_lazy_load_esm("ext:trex/trex_lib.js")` in the runtime's
+    // namespaces.js -- nothing imports it eagerly. `op_lazy_load_esm`
+    // resolves *only* from `lazy_loaded_esm` sources (just as
+    // `core.loadExtScript` resolves only from `lazy_loaded_js`), so these
+    // files must live in that bucket or the op throws "cannot be
+    // lazy-loaded as it was not included in the binary" and the whole
+    // `Trex` namespace silently collapses to `{}`.
+    //
+    // All four files go here, not just the entry point: `trex_lib.js`
+    // statically imports the other three, and those imports are resolved by
+    // `LazyEsmModuleLoader`, which likewise only sees `lazy_loaded_esm`
+    // sources. (Same reason `ext/node` registers `internal_binding/mod.ts`
+    // as `lazy_loaded_esm`.) That loader also has no `ext:`-relative
+    // resolution, so the imports themselves use absolute `ext:trex/...`
+    // specifiers -- see the note at the top of `js/trex_lib.js`.
+    //
+    // There is deliberately no `esm` / `esm_entry_point`: `trex_lib.js` has
+    // no init-time side effects (it only declares exports), and an eager
+    // `esm` file that no evaluated module imports fails snapshot validation
+    // with `NonEvaluatedModules`.
+    lazy_loaded_esm = [
         dir "js",
         "trex_lib.js",
         "dbconnection.js",

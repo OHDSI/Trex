@@ -7,7 +7,7 @@ Deno.test("loadAgent loads instructions, config and tools from an eve-layout dir
   const a = await loadAgent(TOY);
   assert(a.instructions.includes("toy demo agent"));
   assertEquals(a.config.model, "anthropic/claude-sonnet-5");
-  assertEquals(Object.keys(a.tools).sort(), ["echo", "propose_card"]);
+  assertEquals(Object.keys(a.tools), ["echo", "propose_card"]);
   assertEquals(a.tools.propose_card.clientOnly, true);
 });
 
@@ -178,9 +178,10 @@ Deno.test("loadAgent ignores eve dirs we don't support, without failing", async 
 
 Deno.test("loadAgent discovers channels/*.{ts,js} as branded ChannelDefs keyed by filename", async () => {
   const a = await loadAgent(TOY);
-  // Order is Deno.readDir-dependent; assert the set, not the sequence. The toy
-  // agent ships `webhook` plus the authored `custom-hook` channel (Task 7).
-  assertEquals(Object.keys(a.channels).sort(), ["custom-hook", "webhook"]);
+  // Name order, not Deno.readDir order — the loader sorts every directory
+  // scan (see readDirSorted). The toy agent ships `webhook` plus the authored
+  // `custom-hook` channel (Task 7).
+  assertEquals(Object.keys(a.channels), ["custom-hook", "webhook"]);
   assert(a.channels.webhook.__trexChannel);
   assertEquals(a.channels.webhook.routes[0].method, "POST");
   assertEquals(a.channels.webhook.routes[0].path, "/message");
@@ -350,4 +351,41 @@ Deno.test("loadAgent preserves config.escalate", async () => {
   await Deno.writeTextFile(`${tmp}/agent.ts`, 'export default { escalate: "!GitPush" };\n');
   const a = await loadAgent(tmp);
   assertEquals(a.config.escalate, "!GitPush");
+});
+
+// The loaded agent's shape must not depend on the order the filesystem
+// enumerates a directory in. Deno.readDir is unordered by contract, and in
+// practice ext4 (CI) hands back htree-hash order while APFS (dev machines)
+// hands back something else again — which is how toolset.test.ts's
+// `["echo", "propose_card", ...]` assertions could pass on one host and fail
+// on another with nothing between them but the checkout. Sorting is what
+// makes the tool list — the prefix of every model request, and the thing
+// withToolCachePoint hangs its cache breakpoint off the end of — the same
+// everywhere. Stubbing Deno.readDir is the only way to exercise this: on any
+// single host the real enumeration order is a constant.
+Deno.test("loadAgent orders tools/channels/connections/subagents by name, whatever order readDir yields", async () => {
+  const orig = Deno.readDir;
+  // deno-lint-ignore no-explicit-any
+  (Deno as any).readDir = (path: string | URL) => {
+    const inner = orig(path);
+    return (async function* () {
+      const all: Deno.DirEntry[] = [];
+      for await (const e of inner) all.push(e);
+      // Reverse-sorted: the worst case for a loader that just takes what it
+      // is given, and independent of what this host's filesystem does.
+      all.sort((x, y) => (x.name < y.name ? 1 : x.name > y.name ? -1 : 0));
+      yield* all;
+    })();
+  };
+  try {
+    const a = await loadAgent(TOY);
+    assertEquals(Object.keys(a.tools), ["echo", "propose_card"]);
+    assertEquals(Object.keys(a.channels), ["custom-hook", "webhook"]);
+    assertEquals(Object.keys(a.connections), ["echo"]);
+    assertEquals(Object.keys(a.subagents), ["shouter"]);
+    assertEquals(a.skills.map((s) => s.name), ["greeting-style"]);
+  } finally {
+    // deno-lint-ignore no-explicit-any
+    (Deno as any).readDir = orig;
+  }
 });

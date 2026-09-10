@@ -187,6 +187,27 @@ export function resolveChildSkills(parent: string[], child: string[] | undefined
   return child.filter((s) => allowed.has(s));
 }
 
+// Deno.readDir yields entries in whatever order the filesystem hands them
+// back: ext4's htree seed is per-volume, so two machines checking out the
+// same commit can enumerate the same directory differently, and a CI runner
+// can disagree with a developer's laptop. Everything scanned below is keyed
+// into an ordered Record (or array) whose iteration order reaches the model:
+// buildSdkTools walks `agent.tools` in insertion order to build the SDK tool
+// set, that set is the prefix of every request (so a shuffled order is a
+// prompt-cache miss), and withToolCachePoint puts its cache breakpoint on the
+// LAST tool — which, for a subagent, gets no built-ins appended after it and
+// is therefore whichever tool file the filesystem happened to yield last.
+// Sorting by name here makes a loaded agent identical wherever it loads.
+// skills/ already sorted its result for the same reason; nothing else did.
+async function readDirSorted(path: string): Promise<Deno.DirEntry[]> {
+  const entries: Deno.DirEntry[] = [];
+  for await (const entry of Deno.readDir(path)) entries.push(entry);
+  // Code-unit order, not localeCompare: the comparison must not depend on the
+  // host's default locale either.
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return entries;
+}
+
 export async function loadAgent(dir: string, opts: { depth?: number } = {}): Promise<LoadedAgent> {
   const depth = opts.depth ?? 0;
   let instructions: string | null = null;
@@ -270,7 +291,7 @@ export async function loadAgent(dir: string, opts: { depth?: number } = {}): Pro
 
   const tools: Record<string, ToolDef> = {};
   try {
-    for await (const entry of Deno.readDir(`${dir}/tools`)) {
+    for (const entry of await readDirSorted(`${dir}/tools`)) {
       if (!entry.isFile) continue;
       // Colocated test files (e.g. dispatchToCode.test.ts) are the
       // established convention alongside tool/lib modules in this repo —
@@ -315,7 +336,7 @@ export async function loadAgent(dir: string, opts: { depth?: number } = {}): Pro
 
   const channels: Record<string, ChannelDef> = {};
   try {
-    for await (const entry of Deno.readDir(`${dir}/channels`)) {
+    for (const entry of await readDirSorted(`${dir}/channels`)) {
       if (!entry.isFile) continue;
       // Colocated test files (e.g. discord.load.test.ts) are the established
       // convention alongside channel modules in this repo — skip them rather
@@ -338,7 +359,7 @@ export async function loadAgent(dir: string, opts: { depth?: number } = {}): Pro
 
   const connections: Record<string, ConnectionDef> = {};
   try {
-    for await (const entry of Deno.readDir(`${dir}/connections`)) {
+    for (const entry of await readDirSorted(`${dir}/connections`)) {
       if (!entry.isFile) continue;
       const m = entry.name.match(/^(.+)\.(ts|js|mts|mjs)$/);
       if (!m) continue;
@@ -360,7 +381,7 @@ export async function loadAgent(dir: string, opts: { depth?: number } = {}): Pro
 
   const skills: SkillMeta[] = [];
   try {
-    for await (const entry of Deno.readDir(`${dir}/skills`)) {
+    for (const entry of await readDirSorted(`${dir}/skills`)) {
       if (entry.isFile && entry.name.endsWith(".md")) {
         const path = `${dir}/skills/${entry.name}`;
         skills.push({
@@ -411,7 +432,7 @@ export async function loadAgent(dir: string, opts: { depth?: number } = {}): Pro
 
   const subagents: Record<string, LoadedAgent> = {};
   try {
-    for await (const entry of Deno.readDir(`${dir}/subagents`)) {
+    for (const entry of await readDirSorted(`${dir}/subagents`)) {
       if (!entry.isDirectory) continue;
       if (depth >= 1) {
         console.log(`agents: ${dir}/subagents ignored — subagents are one level deep only`);
