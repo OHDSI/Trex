@@ -10,6 +10,8 @@ import {
 import { hashPassword, verifyPassword } from "./password.ts";
 import { authLimiter, apiLimiter } from "../middleware/rate-limit.ts";
 import { isRefreshTokenExpired } from "./refresh-token-ttl.ts";
+import { loadExternalProviders } from "./settings-providers.ts";
+import { IDP_METADATA_KEY } from "./oidc/claims.ts";
 
 const router = Router();
 router.use(express.json());
@@ -60,7 +62,9 @@ function toGoTrueUser(u: DbUser) {
   };
 }
 
-async function createTokenResponse(user: DbUser, sessionId?: string, res?: any) {
+// Exported for the federation callback, which finishes an upstream sign-in by
+// issuing the very same session this grant issues.
+export async function createTokenResponse(user: DbUser, sessionId?: string, res?: any) {
   const sid = sessionId || crypto.randomUUID();
   const accessToken = await signAccessToken(
     {
@@ -297,15 +301,24 @@ async function handlePasswordGrant(req: any, res: any) {
       await migratePasswordHash(user.id, newHash);
     }
 
-    const response = await createTokenResponse(user, undefined, res);
-
-    // Update last_sign_in_at
+    // This session is a native one, so any federation block left by an earlier
+    // federated sign-in stops describing it. Dropped rather than left to age:
+    // the OIDC provider reads that block to decide whether to emit
+    // idp_provider/idp_groups, and a stale one would have trex assert that a
+    // password session came from an upstream. Also stamps last_sign_in_at,
+    // which this grant already owed the row.
     await pool.query(
-      `UPDATE trexdb."user" SET last_sign_in_at = NOW() WHERE id = $1`,
-      [user.id],
+      `UPDATE trexdb."user"
+          SET last_sign_in_at = NOW(),
+              app_metadata = COALESCE(app_metadata, '{}'::jsonb) - $2::text
+        WHERE id = $1`,
+      [user.id, IDP_METADATA_KEY],
     );
+    // The row was read before that UPDATE, so the response body would still
+    // carry the block that no longer exists.
+    if (user.app_metadata) delete user.app_metadata[IDP_METADATA_KEY];
 
-    res.json(response);
+    res.json(await createTokenResponse(user, undefined, res));
   } catch (err) {
     console.error("[auth] password grant error:", err);
     res.status(500).json({ error: "server_error", error_description: "Internal server error" });
@@ -771,19 +784,6 @@ router.get("/accounts", apiLimiter, async (req, res) => {
 
 router.get("/settings", apiLimiter, async (_req, res) => {
   try {
-    // Check which SSO providers are enabled
-    let providers: Record<string, boolean> = {};
-    try {
-      const result = await pool.query(
-        `SELECT id FROM trexdb.sso_provider WHERE enabled = true`,
-      );
-      for (const row of result.rows) {
-        providers[row.id] = true;
-      }
-    } catch {
-      // Table may not exist yet
-    }
-
     // Check self-registration
     let disableSignup = true;
     try {
@@ -795,14 +795,14 @@ router.get("/settings", apiLimiter, async (_req, res) => {
       // Default: disabled
     }
 
+    // Providers come from sso_provider so a client can discover what is
+    // actually configured, rather than a fixed list that is wrong either way.
+    // Failure (missing table, DB hiccup) falls back to email-only inside
+    // loadExternalProviders rather than 500ing this endpoint.
+    const external = await loadExternalProviders(pool);
+
     res.json({
-      external: {
-        email: true,
-        google: providers["google"] || false,
-        github: providers["github"] || false,
-        microsoft: providers["microsoft"] || false,
-        apple: providers["apple"] || false,
-      },
+      external,
       disable_signup: disableSignup,
       mailer_autoconfirm: true,
       phone_autoconfirm: false,

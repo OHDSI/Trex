@@ -165,7 +165,13 @@ Deno.test("buildSdkTools: deferredTools empty (the default) never adds a provide
     hookCtx: fakeHookCtx(),
     model: { provider: "anthropic.messages", modelId: "claude-sonnet-5" },
   });
-  assertEquals(Object.keys(tools), ["echo", "propose_card", "skill", "agent", "connection_search"]);
+  // Membership, not order: the tool set is assembled from several sources
+  // (authored tools, connections, built-ins) and their insertion order is an
+  // implementation detail that has changed without these tests meaning to care.
+  assertEquals(
+    Object.keys(tools).sort(),
+    ["agent", "connection_search", "echo", "propose_card", "skill"],
+  );
   for (const [name, def] of Object.entries(tools)) {
     assert(
       !Object.hasOwn(def as object, "providerOptions"),
@@ -206,7 +212,13 @@ Deno.test("buildSdkTools: a deferredTools entry naming no real tool is ignored, 
   const agent = await loadAgent(TOY);
   agent.config.context.deferredTools = ["NoSuchTool"];
   const tools = await buildSdkTools({ agent, sessionId: "s-1", depth: 0, hookCtx: fakeHookCtx() });
-  assertEquals(Object.keys(tools), ["echo", "propose_card", "skill", "agent", "connection_search"]);
+  // Membership, not order: the tool set is assembled from several sources
+  // (authored tools, connections, built-ins) and their insertion order is an
+  // implementation detail that has changed without these tests meaning to care.
+  assertEquals(
+    Object.keys(tools).sort(),
+    ["agent", "connection_search", "echo", "propose_card", "skill"],
+  );
 });
 
 // ---------------------------------------------------------------------------

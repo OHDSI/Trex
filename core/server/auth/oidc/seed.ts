@@ -23,10 +23,16 @@ export async function upsertClient(spec: SeedClientSpec): Promise<void> {
   const secretHash = spec.clientSecret ? await hashPassword(spec.clientSecret) : null;
 
   await pool.query(
+    // allowed_scopes is the one field that is only written when configured:
+    // COALESCE leaves an unset TREX_OIDC_CLIENT_SCOPES meaning "whatever the
+    // row already has", so a deployment that granted a scope by hand does not
+    // lose it on the next restart, and a first insert still lands on the
+    // column's own default.
     `INSERT INTO trexdb.oidc_client
        (client_id, client_secret_hash, name, redirect_uris,
-        post_logout_redirect_uris, require_pkce, client_roles)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+        post_logout_redirect_uris, require_pkce, client_roles, allowed_scopes)
+     VALUES ($1, $2, $3, $4, $5, $6, $7,
+             COALESCE($8::text[], ARRAY['openid', 'profile', 'email']))
      ON CONFLICT (client_id) DO UPDATE
         SET client_secret_hash = EXCLUDED.client_secret_hash,
             name = EXCLUDED.name,
@@ -34,6 +40,7 @@ export async function upsertClient(spec: SeedClientSpec): Promise<void> {
             post_logout_redirect_uris = EXCLUDED.post_logout_redirect_uris,
             require_pkce = EXCLUDED.require_pkce,
             client_roles = EXCLUDED.client_roles,
+            allowed_scopes = COALESCE($8::text[], trexdb.oidc_client.allowed_scopes),
             updated_at = now()`,
     [
       spec.clientId,
@@ -45,6 +52,7 @@ export async function upsertClient(spec: SeedClientSpec): Promise<void> {
       // for public ones, which have nothing else to prove who they are.
       secretHash === null,
       spec.clientRoles,
+      spec.allowedScopes ?? null,
     ],
   );
 }
