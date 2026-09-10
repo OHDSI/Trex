@@ -1,4 +1,5 @@
-import { assertEquals, assertNotEquals, assertRejects, assertThrows } from "jsr:@std/assert";
+import { assertEquals, assertNotEquals, assertRejects, assertStringIncludes, assertThrows } from "jsr:@std/assert";
+import { _resetDekCache, _setDekForTests, decryptWithDek } from "../dek.ts";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "npm:jose";
 import { applyClaimMap, federationEnabled } from "./config.ts";
 import { hashBinding, signState, stateKeys, verifyState } from "./state.ts";
@@ -11,7 +12,9 @@ import {
   findLinkCandidateByEmail,
   findLinkedUser,
   loadProviders,
+  readAccountTokens,
   resolveFederatedUser,
+  upsertAccount,
 } from "./providers.ts";
 import {
   _resetInsecureBindingWarning,
@@ -808,6 +811,170 @@ Deno.test("a first-time identity outside the allowlist is refused before any lin
     await resolveFederatedUser(client, provider({ emailDomainAllowlist: ["corp.test"] }), identity(true)),
     { action: "refuse", reason: "email_domain_not_allowed" },
   );
+});
+
+// ── Upstream tokens at rest (providers.ts) ─────────────────────────────────
+
+/**
+ * The DEK is a process-wide singleton, so pin a known one for these tests and
+ * clear it afterwards rather than leaving it set for whatever file deno runs
+ * next.
+ */
+function withDek(): void {
+  _setDekForTests(crypto.getRandomValues(new Uint8Array(32)));
+}
+
+/** Captures the parameter array upsertAccount would send to Postgres. */
+function captureClient(stored: Record<string, unknown> = {}) {
+  const calls: unknown[][] = [];
+  return {
+    calls,
+    stored,
+    query(sql: string, params: unknown[]): Promise<{ rows: unknown[] }> {
+      if (sql.includes("INSERT INTO trexdb.account")) {
+        calls.push(params);
+        // Emulate the ON CONFLICT COALESCE: a NULL incoming refresh token
+        // leaves whatever is stored, anything else replaces it.
+        stored.accessToken = params[4];
+        stored.refreshToken = params[5] ?? stored.refreshToken ?? null;
+        stored.idToken = params[8];
+        return Promise.resolve({ rows: [] });
+      }
+      if (sql.includes("FROM trexdb.account")) {
+        return Promise.resolve({ rows: [{ userId: "u-1", ...stored }] });
+      }
+      throw new Error(`unexpected query: ${sql}`);
+    },
+  };
+}
+
+Deno.test("upstream tokens are ciphertext in the row and plaintext through the reader", async () => {
+  withDek();
+  try {
+    const client = captureClient();
+    await upsertAccount(client, {
+      userId: "u-1",
+      providerId: "logto",
+      accountId: "s-1",
+      accessToken: "upstream-access",
+      refreshToken: "upstream-refresh",
+      idToken: "upstream-id",
+      scope: "openid email",
+    });
+
+    const [params] = client.calls;
+    // Nothing recognisable reaches the statement.
+    for (const [i, plain] of [[4, "upstream-access"], [5, "upstream-refresh"], [8, "upstream-id"]] as const) {
+      const stored = params[i] as string;
+      assertNotEquals(stored, plain);
+      assertEquals(stored.includes(plain), false);
+      // …and it really is this DEK's ciphertext, not an encoding.
+      assertEquals(await decryptWithDek(stored), plain);
+    }
+    // scope is not a credential and stays readable, as before.
+    assertEquals(params[7], "openid email");
+
+    const back = await readAccountTokens(client, "logto", "s-1");
+    assertEquals(back?.accessToken, "upstream-access");
+    assertEquals(back?.refreshToken, "upstream-refresh");
+    assertEquals(back?.idToken, "upstream-id");
+  } finally {
+    _resetDekCache();
+  }
+});
+
+Deno.test("the same token seals differently every time (fresh IV)", async () => {
+  withDek();
+  try {
+    const a = captureClient();
+    const b = captureClient();
+    const args = { userId: "u-1", providerId: "logto", accountId: "s-1", accessToken: "same" };
+    await upsertAccount(a, args);
+    await upsertAccount(b, args);
+    assertNotEquals(a.calls[0][4], b.calls[0][4]);
+    // Which is exactly why nothing may compare these columns — only null-test
+    // them, as the ON CONFLICT COALESCE does.
+  } finally {
+    _resetDekCache();
+  }
+});
+
+// The behaviour the plaintext version had, which encrypting must not break:
+// a provider that issues a refresh token only on first authorization must not
+// have it destroyed by the next sign-in.
+Deno.test("an absent refresh token reaches SQL as NULL, so COALESCE preserves the stored one", async () => {
+  withDek();
+  try {
+    const client = captureClient();
+    await upsertAccount(client, {
+      userId: "u-1", providerId: "logto", accountId: "s-1",
+      accessToken: "a1", refreshToken: "the-only-refresh-token",
+    });
+    for (const absent of [undefined, ""]) {
+      await upsertAccount(client, {
+        userId: "u-1", providerId: "logto", accountId: "s-1",
+        accessToken: "a2", refreshToken: absent,
+      });
+      // NULL, not a ciphertext of "" — a ciphertext is non-null and COALESCE
+      // would take it, wiping the stored token.
+      assertEquals(client.calls.at(-1)?.[5], null);
+    }
+    const back = await readAccountTokens(client, "logto", "s-1");
+    assertEquals(back?.refreshToken, "the-only-refresh-token");
+    assertEquals(back?.accessToken, "a2");
+  } finally {
+    _resetDekCache();
+  }
+});
+
+Deno.test("a NULL token column reads back as null rather than failing", async () => {
+  withDek();
+  try {
+    const client = captureClient();
+    await upsertAccount(client, { userId: "u-1", providerId: "logto", accountId: "s-1" });
+    assertEquals(client.calls[0][4], null);
+    assertEquals(client.calls[0][8], null);
+    const back = await readAccountTokens(client, "logto", "s-1");
+    assertEquals(back, {
+      userId: "u-1", accessToken: null, refreshToken: null, idToken: null,
+      accessTokenExpiresAt: null, scope: null,
+    });
+    assertEquals(await readAccountTokens(captureClientEmpty(), "logto", "s-1"), null);
+  } finally {
+    _resetDekCache();
+  }
+});
+
+function captureClientEmpty() {
+  return { query: () => Promise.resolve({ rows: [] }) };
+}
+
+// Fail closed: storing a live upstream credential in the clear because
+// encryption was unavailable is the outcome this change exists to prevent.
+Deno.test("with no DEK the write fails rather than storing plaintext", async () => {
+  _resetDekCache();
+  const client = captureClient();
+  await assertRejects(
+    () =>
+      upsertAccount(client, {
+        userId: "u-1", providerId: "logto", accountId: "s-1", accessToken: "upstream-access",
+      }),
+    Error,
+    "could not encrypt upstream access token",
+  );
+  assertEquals(client.calls.length, 0);
+});
+
+Deno.test("an undecryptable stored token is surfaced, not silently reported absent", async () => {
+  withDek();
+  try {
+    // What a row written before these columns were encrypted looks like.
+    const client = captureClient({ accessToken: "plaintext-from-an-older-row" });
+    const err = await assertRejects(() => readAccountTokens(client, "logto", "s-1"), Error);
+    assertStringIncludes(err.message, "could not decrypt stored upstream access token");
+  } finally {
+    _resetDekCache();
+  }
 });
 
 // ── Federation RP routes (router.ts) ────────────────────────────────────────

@@ -1,4 +1,5 @@
 // The only module in federation/ that talks to the database.
+import { decryptWithDek, encryptWithDek } from "../dek.ts";
 import { decideLink, type ExistingUser, type LinkDecision } from "./link.ts";
 import type { ProviderConfig, UpstreamIdentity } from "./types.ts";
 
@@ -179,6 +180,99 @@ export async function provisionUser(client: PgClient, identity: UpstreamIdentity
   return id;
 }
 
+/**
+ * Encrypt one upstream token for storage, or return SQL NULL if there isn't one.
+ *
+ * The null mapping is load-bearing, not tidiness. upsertAccount's ON CONFLICT
+ * preserves a stored refresh token when the incoming one is absent, and it does
+ * that with COALESCE(EXCLUDED, stored) — a *null test*, never a comparison. So
+ * the rule the plaintext version relied on has to survive verbatim: an absent
+ * token must reach the statement as NULL. Encrypting "" (or the string
+ * "undefined") would produce a perfectly good ciphertext, COALESCE would take
+ * it, and the stored refresh token would be destroyed by a sign-in that simply
+ * did not carry one.
+ *
+ * Nothing anywhere compares these columns, which is what makes ciphertext safe
+ * here at all: AES-GCM with a fresh IV encrypts the same token differently
+ * every time, so the stored value churns on each sign-in even when the upstream
+ * token has not changed. Only null-ness is ever tested, and that is preserved.
+ *
+ * Failure is fatal to the sign-in by design. The DEK is initialised at boot
+ * (index.ts, before server.listen, and a failure there aborts boot), so the
+ * only way this throws in practice is a genuinely broken key state — and
+ * storing a live upstream credential in the clear because encryption was
+ * unavailable is precisely the outcome this change exists to prevent. The
+ * caller's transaction rolls back and /callback answers with its generic
+ * failure, with the detail in the log.
+ */
+async function sealToken(
+  value: string | null | undefined,
+  label: string,
+): Promise<string | null> {
+  if (typeof value !== "string" || value.length === 0) return null;
+  try {
+    return await encryptWithDek(value);
+  } catch (err) {
+    // Never log the value; name the column and re-throw.
+    throw new Error(`could not encrypt upstream ${label}: ${err}`);
+  }
+}
+
+/** Reverse of sealToken. NULL stays null; ciphertext is decrypted or throws. */
+async function openToken(value: string | null | undefined, label: string): Promise<string | null> {
+  if (typeof value !== "string" || value.length === 0) return null;
+  try {
+    return await decryptWithDek(value);
+  } catch (err) {
+    // A decrypt failure means the stored value is not usable under the current
+    // key — a rotated/lost KEK, or a row written before these columns were
+    // encrypted. Surfacing it beats handing a caller a token-shaped null and
+    // letting it conclude the upstream never issued one.
+    throw new Error(`could not decrypt stored upstream ${label}: ${err}`);
+  }
+}
+
+/** The upstream tokens held for one linked identity, decrypted. */
+export interface UpstreamTokens {
+  userId: string;
+  accessToken: string | null;
+  refreshToken: string | null;
+  idToken: string | null;
+  accessTokenExpiresAt: Date | null;
+  scope: string | null;
+}
+
+/**
+ * Read back what upsertAccount stored. The three token columns are ciphertext
+ * at rest (see sealToken), so every reader must come through here rather than
+ * SELECTing the columns directly — including phase 5's PhysioNet token broker,
+ * which is the first consumer this exists for.
+ */
+export async function readAccountTokens(
+  client: PgClient,
+  providerId: string,
+  accountId: string,
+): Promise<UpstreamTokens | null> {
+  const { rows } = await client.query(
+    `SELECT "userId", "accessToken", "refreshToken", "idToken",
+            "accessTokenExpiresAt", scope
+       FROM trexdb.account
+      WHERE "providerId" = $1 AND "accountId" = $2
+      LIMIT 1`,
+    [providerId, accountId],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    userId: row.userId,
+    accessToken: await openToken(row.accessToken, "access token"),
+    refreshToken: await openToken(row.refreshToken, "refresh token"),
+    idToken: await openToken(row.idToken, "id token"),
+    accessTokenExpiresAt: row.accessTokenExpiresAt ?? null,
+    scope: row.scope ?? null,
+  };
+}
+
 export async function upsertAccount(client: PgClient, args: {
   userId: string;
   providerId: string;
@@ -189,6 +283,17 @@ export async function upsertAccount(client: PgClient, args: {
   scope?: string;
   idToken?: string;
 }): Promise<void> {
+  // These are live credentials at another identity provider: an access token
+  // that speaks for the person at the upstream, a refresh token that mints more
+  // of them, and an id_token. They are encrypted under the DEK before they
+  // reach the statement, so the row (and any dump or replica of it) holds no
+  // usable credential. RLS on trexdb.account remains the outer guard; this is
+  // the one that survives a copy of the data.
+  const [accessToken, refreshToken, idToken] = await Promise.all([
+    sealToken(args.accessToken, "access token"),
+    sealToken(args.refreshToken, "refresh token"),
+    sealToken(args.idToken, "id token"),
+  ]);
   await client.query(
     `INSERT INTO trexdb.account
        (id, "userId", "accountId", "providerId", "accessToken", "refreshToken",
@@ -210,8 +315,8 @@ export async function upsertAccount(client: PgClient, args: {
        "updatedAt" = NOW()`,
     [
       crypto.randomUUID(), args.userId, args.accountId, args.providerId,
-      args.accessToken ?? null, args.refreshToken ?? null,
-      args.accessTokenExpiresAt ?? null, args.scope ?? null, args.idToken ?? null,
+      accessToken, refreshToken,
+      args.accessTokenExpiresAt ?? null, args.scope ?? null, idToken,
     ],
   );
 }
