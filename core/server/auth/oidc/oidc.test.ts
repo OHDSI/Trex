@@ -261,6 +261,30 @@ Deno.test("a seeded client reads its uris as a list, however they are separated"
   assertEquals(spec?.postLogoutRedirectUris, ["https://a.test/atlas/"]);
 });
 
+// A scope is grantable only if the client lists it, and the column default is
+// openid/profile/email — so without this the idp_groups scope could never
+// reach the client trex seeds for itself.
+Deno.test("a seeded client can be configured with the scopes it may be granted", () => {
+  const base = {
+    TREX_OIDC_CLIENT_ID: "d2e-webapi",
+    TREX_OIDC_CLIENT_REDIRECT_URIS: "https://a.test/cb/openid",
+  };
+  assertEquals(
+    parseSeedClient({ ...base, TREX_OIDC_CLIENT_SCOPES: "openid profile email idp_groups" })
+      ?.allowedScopes,
+    ["openid", "profile", "email", "idp_groups"],
+  );
+  // openid is what makes the request an OIDC one; /authorize refuses without
+  // it, so a list that omits it gets it.
+  assertEquals(
+    parseSeedClient({ ...base, TREX_OIDC_CLIENT_SCOPES: "email, idp_groups" })?.allowedScopes,
+    ["openid", "email", "idp_groups"],
+  );
+  // Unset means "leave the row's scopes alone", not "reset them".
+  assertEquals(parseSeedClient(base)?.allowedScopes, undefined);
+  assertEquals(parseSeedClient({ ...base, TREX_OIDC_CLIENT_SCOPES: "  " })?.allowedScopes, undefined);
+});
+
 Deno.test("a seeded client carries the roles it is configured with", () => {
   const spec = parseSeedClient({
     TREX_OIDC_CLIENT_ID: "d2e-webapi",

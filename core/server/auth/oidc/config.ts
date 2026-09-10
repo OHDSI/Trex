@@ -51,6 +51,18 @@ export interface SeedClientSpec {
   postLogoutRedirectUris: string[];
   /** Roles the client itself carries, for the client credentials grant. */
   clientRoles: string[];
+  /**
+   * Scopes this client may be granted. Undefined means "not configured": the
+   * row keeps whatever it has (or the column default on a first insert), so a
+   * deployment that set them by hand does not have them reset on every boot.
+   *
+   * It exists because a scope is grantable only when the client lists it —
+   * grantedScopes() narrows every request to allowed_scopes — and the column
+   * default is openid/profile/email. Without this, the `idp_groups` scope that
+   * carries federated group membership could never reach the client trex seeds
+   * itself, and the whole claims contract would be inert for it.
+   */
+  allowedScopes?: string[];
 }
 
 const splitList = (raw: string | undefined): string[] =>
@@ -78,5 +90,18 @@ export function parseSeedClient(
     redirectUris,
     postLogoutRedirectUris: splitList(env.TREX_OIDC_CLIENT_POST_LOGOUT_URIS),
     clientRoles: splitList(env.TREX_OIDC_CLIENT_ROLES),
+    allowedScopes: parseScopes(env.TREX_OIDC_CLIENT_SCOPES),
   };
+}
+
+/**
+ * `openid` is added when it is missing: without it /authorize refuses the
+ * request outright with invalid_scope, so a scope list that omits it can only
+ * ever be a configuration mistake, and one whose symptom points nowhere near
+ * the setting that caused it.
+ */
+function parseScopes(raw: string | undefined): string[] | undefined {
+  const scopes = splitList(raw);
+  if (scopes.length === 0) return undefined;
+  return scopes.includes("openid") ? scopes : ["openid", ...scopes];
 }
