@@ -1608,6 +1608,67 @@ jobs:
             '
           ls -l d2e/.ci-overlay/core-*.eszip
 
+      # The d2e CLI's `-d ./plugins/functions` does more than name a source dir:
+      # it pulls in docker-compose-local.yml, whose trex service bind-mounts
+      #   ${D2E_FUNCTIONS:-./plugins/functions}:/usr/src/bundled-plugins/d2e-functions
+      # over the plugin the image extracted from the published
+      # @data2evidence/d2e-functions tarball — replacing a BUILT plugin with a bare
+      # git checkout. d2e builds that tarball (docker-build-push.yaml build_plugins
+      # -> `install-deno-deps.js` = `deno install --node-modules-dir` per function,
+      # then `tbuild .`, which bundles each declared function to .eszip and rewrites
+      # package.json from package.org.json). A checkout has neither the bundles nor
+      # the node_modules — `npm install` at the d2e repo root does not produce them —
+      # so under the mount every d2e function loads from source and resolves its npm
+      # graph over the network at worker-boot time.
+      #
+      # That is not merely slow. alp-dataflow-gen-init (the largest graph, and the
+      # only init function whose boot is deferred ~20s by
+      # waitforEnvVar: PREFECT_HEALTH_CHECK, so it resolves concurrently with the
+      # rest of boot rather than serially) dies with
+      #   worker boot error: failed to bootstrap runtime: No such file or directory
+      # It is the sole writer of every Prefect variable, secret, the flow-results
+      # block and the work-pool template, and _callInit only logs the failure — so
+      # the stack comes up looking healthy and setupdemo dies minutes later at
+      # "Running DQD on demo dataset ... status code 500" with
+      #   Unable to find block document named trex-sql-password
+      # d2e's own e2e for the same commit does NOT pass -d, makes zero npm
+      # downloads and passes setupdemo; trex's E2E has never seeded Prefect.
+      #
+      # The mount buys nothing anyway: the tag resolution above pins the image to
+      # the d2e checkout's own SHA, so image and checkout are the same revision.
+      # So point D2E_FUNCTIONS at the image's own built copy instead. One `cp -a`
+      # of the whole tree, not per-function, so the cross-directory hardlinks that
+      # forced d2e's Dockerfile into a two-pass extractor survive the copy.
+      #
+      # The e2e seed patch is unaffected: docker-compose-ci.yml mounts the patched
+      # 03_Config.ts from the checkout directly onto the container path, which
+      # still wins as a nested mount.
+      - name: Stage the image's built d2e-functions
+        if: env.D2E_UNAVAILABLE != 'true'
+        run: |
+          IMG="${DOCKER_IMAGE_PREFIX:-ghcr.io/ohdsi/}d2e-trex:${DOCKER_TAG_NAME:-develop}"
+          rm -rf d2e/.ci-functions
+          mkdir -p d2e/.ci-functions
+          docker run --rm \
+            -v "$PWD/d2e/.ci-functions:/out" \
+            --entrypoint bash "$IMG" -c '
+              set -eu
+              src=/usr/src/bundled-plugins/d2e-functions
+              [ -d "$src" ] || { echo "::error::$src missing from the image"; exit 1; }
+              cp -a "$src/." /out/
+            '
+          # Assert the staged tree really is built. Without this the step could
+          # silently stage something no better than the checkout and the next E2E
+          # would fail identically, for a reason nobody re-derives.
+          ESZIPS=$(find d2e/.ci-functions -name '*.eszip' | wc -l)
+          NODEMODS=$(find d2e/.ci-functions -maxdepth 3 -type d -name node_modules -prune | wc -l)
+          echo "staged d2e-functions: ${ESZIPS} eszip bundle(s), ${NODEMODS} node_modules tree(s), $(du -sh d2e/.ci-functions | cut -f1)"
+          if [ "$ESZIPS" -eq 0 ] && [ "$NODEMODS" -eq 0 ]; then
+            echo "::error::the d2e-trex image's d2e-functions has neither eszip bundles nor node_modules; its functions would resolve npm at boot just like the source mount"
+            exit 1
+          fi
+          echo "D2E_FUNCTIONS=$PWD/d2e/.ci-functions" >> "$GITHUB_ENV"
+
       - name: Create CI compose override
         if: env.D2E_UNAVAILABLE != 'true'
         run: |
