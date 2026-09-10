@@ -30,7 +30,7 @@ import { defineTool } from "eve/tools";
 // (agent directories must stay portable to real eve — see eve-shim/types.ts's
 // header comment). The runtime-visible surface is only "eve"/"eve/tools",
 // same as every other agent-authored file.
-import type { QueryFn, ToolContext, ToolDef } from "../../../../core/server/agents/eve-shim/types.ts";
+import type { QueryFn, ToolContext, ToolDef } from "eve/core/eve-shim/types.ts";
 import { ensureAppWorkspace, ensureWorkspace } from "../../functions/tools/workspace.ts";
 import { acceptDeclaredWorkspace, peekSessionScope } from "./session_scope.ts";
 import type { AgentContext as DevxAgentContext, ConsentLevel } from "../../functions/tools/types.ts";

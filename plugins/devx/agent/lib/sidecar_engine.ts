@@ -8,14 +8,14 @@ import { acceptDeclaredWorkspace, loadSessionScope } from "./session_scope.ts";
 import { UNAVAILABLE_TOOL_ERROR } from "../../functions/lib/eve_run.ts";
 // Type-only, erased at runtime — same posture as agent.ts's ToolDef import
 // (these types are not part of eve's public re-export surface).
-import type { AgentEngine, EngineTurn, HookCtx } from "../../../../core/server/agents/eve-shim/types.ts";
+import type { AgentEngine, EngineTurn, HookCtx } from "eve/core/eve-shim/types.ts";
 // Real runtime imports, same posture as agent.ts's hook-output.ts import.
-import { createStore } from "../../../../core/server/agents/service/store.ts";
-import { publish } from "../../../../core/server/agents/service/stream.ts";
-import { runApprovalGate } from "../../../../core/server/agents/service/approval-gate.ts";
-import { toDevxToolInput } from "../../../../core/server/agents/service/engine/tool-input.ts";
-import { deriveScopeKey } from "../../../../core/server/agents/service/scope-key.ts";
-import { parseEscalateList, resolveEscalateFor } from "../../../../core/server/agents/service/approval-policy.ts";
+import { createStore } from "eve/core/service/store.ts";
+import { publish } from "eve/core/service/stream.ts";
+import { runApprovalGate } from "eve/core/service/approval-gate.ts";
+import { toDevxToolInput } from "eve/core/service/engine/tool-input.ts";
+import { deriveScopeKey } from "eve/core/service/scope-key.ts";
+import { parseEscalateList, resolveEscalateFor } from "eve/core/service/approval-policy.ts";
 
 export const SIDECAR_ENGINE_NAME = "claude-code";
 

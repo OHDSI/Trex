@@ -36,14 +36,14 @@ import { defineToolProvider } from "eve/tools";
 // Type-only: see agent.ts's header comment for why ToolDef/HookCtx come from
 // core's eve-shim here rather than "eve"'s public surface / "eve" directly
 // for the type (HookCtx IS re-exported by "eve", used here as a type only).
-import type { HookCtx, ToolDef } from "../../../core/server/agents/eve-shim/types.ts";
-import type { ConnectionDef } from "../../../core/server/agents/connections/types.ts";
+import type { HookCtx, ToolDef } from "eve/core/eve-shim/types.ts";
+import type { ConnectionDef } from "eve/core/connections/types.ts";
 import {
   formatMcpResult,
   hashResolvedAuth,
   type McpConnectFn,
   realizeMcp,
-} from "../../../core/server/agents/connections/mcp.ts";
+} from "eve/core/connections/mcp.ts";
 import { mcpManager } from "../functions/mcp_manager.ts";
 
 interface McpServerRow {

@@ -190,6 +190,17 @@ export async function buildAgentWorkerConfig(
   const channelsBase = `file://${tmp}/agents/channels/`;
   const imports: Record<string, string> = {
     "eve": `${shimBase}mod.ts`,
+    // Everything else core exposes to a staged agent, under its REAL layout.
+    // A plugin agent cannot reach core by relative path: in the repo core sits
+    // at core/server/agents/, but here it is <stage>/agents/, so
+    // "../../../core/server/agents/x.ts" climbs past /tmp to the filesystem
+    // root and the worker dies at module evaluation with
+    // "Module not found: file:///core/server/agents/x.ts". A prefix mapping
+    // rather than one entry per module: the set a plugin agent legitimately
+    // needs keeps growing (six of these appeared in one file), and every
+    // addition that has to be remembered here is another way to ship a broken
+    // agent that still passes the repo-layout loader tests.
+    "eve/core/": `file://${tmp}/agents/`,
     "eve/tools": `${shimBase}tools.ts`,
     "eve/evals": `${shimBase}evals.ts`,
     "eve/connections": `file://${tmp}/agents/connections/shim.ts`,

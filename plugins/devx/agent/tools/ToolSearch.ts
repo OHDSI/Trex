@@ -23,7 +23,7 @@
 // story) -- entering via registry.ts, as this file does, reproduces the
 // safe production order instead.
 import { defineTool } from "eve/tools";
-import type { ToolContext } from "../../../../core/server/agents/eve-shim/types.ts";
+import type { ToolContext } from "eve/core/eve-shim/types.ts";
 import { TOOL_DEFINITIONS } from "../../functions/tools/registry.ts";
 import { DEFERRED_TOOLS } from "../lib/deferred_tools.ts";
 
