@@ -26,7 +26,7 @@ import {
   safeRedirectTo,
   warnIfInsecureBinding,
 } from "./request.ts";
-import { hashBinding, signState, STATE_TTL_SECONDS, stateKey, verifyState } from "./state.ts";
+import { hashBinding, signState, STATE_TTL_SECONDS, stateKeys, verifyState } from "./state.ts";
 import { verifyFederatedIdToken } from "./verify.ts";
 
 // Re-exported so these read as one unit from outside; request.ts exists only to
@@ -89,7 +89,7 @@ export function registerFederationRoutes(
         verifier,
         bind: await hashBinding(binding),
         exp: Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS,
-      }, await stateKey());
+      }, await stateKeys());
 
       const url = new URL(doc.authorization_endpoint);
       url.searchParams.set("response_type", "code");
@@ -131,7 +131,7 @@ export function registerFederationRoutes(
       }
 
       const rawState = String(req.query.state ?? "");
-      const state = await verifyState(rawState, await stateKey());
+      const state = await verifyState(rawState, await stateKeys());
 
       // Before the token exchange, before any database work: a callback that
       // did not start in this browser is login CSRF and must cost nothing to

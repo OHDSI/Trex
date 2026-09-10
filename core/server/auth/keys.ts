@@ -17,6 +17,13 @@ export const LABELS = {
   // label — sharing one HMAC key across two unrelated signing contexts would
   // let a MAC minted for one verify in the other over the same bytes.
   federationState: "trex.federation.state.v1",
+  // AES-GCM key for the SAME state's body. The state is signed for integrity
+  // and encrypted for confidentiality, because it carries the PKCE
+  // code_verifier and travels in the same URL as the authorization code — a
+  // URL that lands in the identity provider's logs and in Referer headers.
+  // A separate label from federationState above: one key, two primitives is
+  // exactly the key-reuse this scheme's per-purpose subkeys exist to avoid.
+  federationStateEncryption: "trex.federation.state.enc.v1",
 } as const;
 
 export type SubkeyLabel = typeof LABELS[keyof typeof LABELS];

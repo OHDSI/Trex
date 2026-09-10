@@ -1,7 +1,23 @@
-// The `state` parameter, signed rather than stored. It carries everything the
-// callback needs (which provider, where to return to, the nonce and the PKCE
-// verifier), so a callback requires no server-side lookup — and because it is
-// signed, none of it can be altered by the browser it travels through.
+// The `state` parameter: encrypted, then signed, rather than stored. It carries
+// everything the callback needs (which provider, where to return to, the nonce
+// and the PKCE verifier), so a callback requires no server-side lookup — the
+// signature means none of it can be altered by the browser it travels through,
+// and the encryption means none of it can be read there either.
+//
+// Why encrypted and not merely signed: the state rides in the same redirect URL
+// as the authorization code, and that URL is written to the identity provider's
+// logs and handed on in Referer headers. client_secret is optional — a provider
+// registered as a public client authenticates with PKCE alone — so anyone who
+// captured a plaintext state held both the code and its code_verifier, and
+// could redeem the code upstream themselves. PKCE bought almost nothing.
+//
+// Why not a server-side store keyed by a state id: trex can run several
+// replicas, and the callback is a fresh browser navigation that any of them may
+// answer. A per-process store would refuse every sign-in whose callback landed
+// on a different replica. (consumeState has that same per-process limitation
+// today, but its failure mode is a weaker replay guarantee, not a broken
+// sign-in.) Encryption keeps the state self-contained: every replica derives
+// the same key from TREX_ROOT_KEY, so nothing has to be shared between them.
 import { deriveSubkeyBase64, LABELS } from "../keys.ts";
 
 export interface StatePayload {
@@ -38,27 +54,67 @@ function b64urlDecode(s: string): Uint8Array {
   return Uint8Array.from(atob(pad), (c) => c.charCodeAt(0));
 }
 
-/** HMAC key for state, derived from the root key like the agents OAuth broker's. */
-export async function stateKey(rootKey?: string): Promise<CryptoKey> {
-  const raw = await deriveSubkeyBase64(LABELS.federationState, rootKey);
-  return crypto.subtle.importKey(
-    "raw",
-    Uint8Array.from(atob(raw), (c) => c.charCodeAt(0)),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign", "verify"],
-  );
+/** AES-GCM nonce length. 96 bits is the size the mode is specified around. */
+const IV_BYTES = 12;
+
+/** The two keys a state is protected with, both derived from the root key. */
+export interface StateKeys {
+  /** HMAC-SHA-256 over the encoded body, like the agents OAuth broker's. */
+  mac: CryptoKey;
+  /** AES-256-GCM over the payload. */
+  enc: CryptoKey;
 }
 
-export async function signState(payload: StatePayload, key: CryptoKey): Promise<string> {
-  const body = b64url(encoder.encode(JSON.stringify(payload)));
-  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
+export async function stateKeys(rootKey?: string): Promise<StateKeys> {
+  const macRaw = await deriveSubkeyBase64(LABELS.federationState, rootKey);
+  const encRaw = await deriveSubkeyBase64(LABELS.federationStateEncryption, rootKey);
+  const [mac, enc] = await Promise.all([
+    crypto.subtle.importKey(
+      "raw",
+      Uint8Array.from(atob(macRaw), (c) => c.charCodeAt(0)),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign", "verify"],
+    ),
+    crypto.subtle.importKey(
+      "raw",
+      Uint8Array.from(atob(encRaw), (c) => c.charCodeAt(0)),
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"],
+    ),
+  ]);
+  return { mac, enc };
+}
+
+/**
+ * `<base64url(iv ‖ ciphertext)>.<base64url(HMAC of that)>`.
+ *
+ * Encrypt-then-MAC: the signature covers the ciphertext, so a tampered state is
+ * rejected before anything is decrypted, and the token keeps the shape (and the
+ * single-use keying in consumeState) it already had.
+ */
+export async function signState(payload: StatePayload, keys: StateKeys): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+  const ciphertext = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: iv.buffer as ArrayBuffer },
+      keys.enc,
+      encoder.encode(JSON.stringify(payload)).buffer as ArrayBuffer,
+    ),
+  );
+  const sealed = new Uint8Array(iv.length + ciphertext.length);
+  sealed.set(iv);
+  sealed.set(ciphertext, iv.length);
+
+  const body = b64url(sealed);
+  const sig = await crypto.subtle.sign("HMAC", keys.mac, encoder.encode(body));
   return `${body}.${b64url(new Uint8Array(sig))}`;
 }
 
 export async function verifyState(
   token: string,
-  key: CryptoKey,
+  keys: StateKeys,
   now: number = Math.floor(Date.now() / 1000),
 ): Promise<StatePayload> {
   const dot = token.indexOf(".");
@@ -67,13 +123,31 @@ export async function verifyState(
   const provided = token.slice(dot + 1);
 
   const expected = b64url(
-    new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(body))),
+    new Uint8Array(await crypto.subtle.sign("HMAC", keys.mac, encoder.encode(body))),
   );
   // Length-independent comparison is unnecessary here (both are fixed-length
   // base64 of a SHA-256 MAC), but constant-time comparison still matters.
   if (!constantTimeEquals(provided, expected)) throw new Error("state signature is invalid");
 
-  const payload = JSON.parse(decoder.decode(b64urlDecode(body))) as StatePayload;
+  const sealed = b64urlDecode(body);
+  if (sealed.length <= IV_BYTES) throw new Error("state is malformed");
+  let plaintext: Uint8Array;
+  try {
+    plaintext = new Uint8Array(
+      await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: sealed.slice(0, IV_BYTES).buffer as ArrayBuffer },
+        keys.enc,
+        sealed.slice(IV_BYTES).buffer as ArrayBuffer,
+      ),
+    );
+  } catch {
+    // The MAC already passed, so this is a body sealed under a different
+    // encryption key — a root-key rotation mid-flow, or two deployments
+    // sharing a MAC key they should not. Either way it is not ours to read.
+    throw new Error("state could not be decrypted");
+  }
+
+  const payload = JSON.parse(decoder.decode(plaintext)) as StatePayload;
   if (payload.exp <= now) throw new Error("state has expired");
   return payload;
 }

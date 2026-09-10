@@ -1,7 +1,7 @@
 import { assertEquals, assertNotEquals, assertRejects, assertThrows } from "jsr:@std/assert";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "npm:jose";
 import { applyClaimMap, federationEnabled } from "./config.ts";
-import { hashBinding, signState, stateKey, verifyState } from "./state.ts";
+import { hashBinding, signState, stateKeys, verifyState } from "./state.ts";
 import { challengeFor, createVerifier } from "./pkce.ts";
 import { clearDiscoveryCache, loadDiscovery } from "./discovery.ts";
 import { verifyFederatedIdToken } from "./verify.ts";
@@ -74,19 +74,19 @@ const payload = {
 };
 
 Deno.test("state round-trips through sign and verify", async () => {
-  const key = await stateKey("test-root-key");
-  const token = await signState(payload, key);
-  assertEquals(await verifyState(token, key, 1_000_000_000), payload);
+  const keys = await stateKeys("test-root-key");
+  const token = await signState(payload, keys);
+  assertEquals(await verifyState(token, keys, 1_000_000_000), payload);
 });
 
 Deno.test("state with a tampered body is rejected", async () => {
-  const key = await stateKey("test-root-key");
-  const token = await signState(payload, key);
+  const keys = await stateKeys("test-root-key");
+  const token = await signState(payload, keys);
   const [body, sig] = token.split(".");
   const forged = btoa(JSON.stringify({ ...payload, redirectTo: "/evil" }))
     .replace(/=+$/, "");
   await assertRejects(
-    () => verifyState(`${forged}.${sig}`, key, 1_000_000_000),
+    () => verifyState(`${forged}.${sig}`, keys, 1_000_000_000),
     Error,
     "signature",
   );
@@ -94,23 +94,77 @@ Deno.test("state with a tampered body is rejected", async () => {
 });
 
 Deno.test("state signed with another key is rejected", async () => {
-  const token = await signState(payload, await stateKey("root-a"));
-  const keyB = await stateKey("root-b");
+  const token = await signState(payload, await stateKeys("root-a"));
+  const keysB = await stateKeys("root-b");
   await assertRejects(
-    () => verifyState(token, keyB, 1_000_000_000),
+    () => verifyState(token, keysB, 1_000_000_000),
     Error,
     "signature",
   );
 });
 
 Deno.test("expired state is rejected", async () => {
-  const key = await stateKey("test-root-key");
-  const token = await signState(payload, key);
+  const keys = await stateKeys("test-root-key");
+  const token = await signState(payload, keys);
   await assertRejects(
-    () => verifyState(token, key, 2_000_000_001),
+    () => verifyState(token, keys, 2_000_000_001),
     Error,
     "expired",
   );
+});
+
+// The reason the body is encrypted at all: this token rides in the same URL as
+// the authorization code, and that URL reaches the identity provider's logs and
+// any Referer header the browser sends on. A plaintext state would hand whoever
+// read it the PKCE code_verifier — and client_secret is optional, so for a
+// public-client provider that is everything needed to redeem the code upstream.
+Deno.test("nothing in the state is readable from the token", async () => {
+  const keys = await stateKeys("test-root-key");
+  const token = await signState(payload, keys);
+
+  assertEquals(token.includes(payload.verifier), false);
+  assertEquals(token.includes(payload.nonce), false);
+  assertEquals(token.includes(payload.redirectTo), false);
+  assertEquals(token.includes(payload.provider), false);
+
+  // Nor after undoing the transport encoding: the bytes are ciphertext.
+  const body = token.slice(0, token.indexOf("."));
+  const norm = body.replace(/-/g, "+").replace(/_/g, "/");
+  const decoded = atob(norm + "=".repeat((4 - (norm.length % 4)) % 4));
+  assertEquals(decoded.includes(payload.verifier), false);
+  assertEquals(decoded.includes(payload.nonce), false);
+  // No field names either — the JSON itself never leaves the process.
+  // (Single characters are not asserted on: over ~250 bytes of ciphertext any
+  // given byte value turns up by chance, and the test would flake.)
+  assertEquals(decoded.includes("verifier"), false);
+  assertEquals(decoded.includes("redirectTo"), false);
+});
+
+Deno.test("the same payload seals differently every time", async () => {
+  const keys = await stateKeys("test-root-key");
+  // A fresh GCM nonce per state: two flows started with identical parameters
+  // must not produce the same token, or consumeState would treat the second as
+  // a replay of the first and refuse a legitimate sign-in.
+  assertNotEquals(await signState(payload, keys), await signState(payload, keys));
+});
+
+// The MAC is over the ciphertext, so it passes here and decryption is what
+// refuses — a root-key rotation between /authorize and /callback, in effect.
+Deno.test("a body sealed under a different encryption key is refused", async () => {
+  const a = await stateKeys("root-a");
+  const b = await stateKeys("root-b");
+  const mismatched = await signState(payload, { mac: a.mac, enc: b.enc });
+  await assertRejects(
+    () => verifyState(mismatched, a, 1_000_000_000),
+    Error,
+    "decrypted",
+  );
+});
+
+Deno.test("a malformed state is refused, not thrown at", async () => {
+  const keys = await stateKeys("test-root-key");
+  await assertRejects(() => verifyState("no-dot-here", keys), Error, "malformed");
+  await assertRejects(() => verifyState("", keys), Error, "malformed");
 });
 
 Deno.test("verifier is unreserved-charset and long enough for RFC 7636", () => {
