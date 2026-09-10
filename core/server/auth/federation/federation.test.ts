@@ -186,6 +186,17 @@ Deno.test("verifiers are not repeated", () => {
   assertNotEquals(createVerifier(), createVerifier());
 });
 
+Deno.test("many verifiers still conform to charset and length (rejection sampling)", () => {
+  // Not a uniformity test (that would be slow and flaky) — just confirms the
+  // rejection-sampling loop in createVerifier always terminates with a
+  // full-length, in-alphabet string, including its rare refill path.
+  for (let i = 0; i < 200; i++) {
+    const v = createVerifier();
+    assertEquals(v.length, 64);
+    assertEquals(/^[A-Za-z0-9\-._~]+$/.test(v), true);
+  }
+});
+
 Deno.test("challenge is the base64url SHA-256 of the verifier", async () => {
   // Known vector from RFC 7636 appendix B.
   const challenge = await challengeFor("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
