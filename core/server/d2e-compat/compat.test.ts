@@ -1,5 +1,5 @@
 import { assertEquals } from "jsr:@std/assert";
-import { D2E_COMPAT, applyD2eCompat, runD2eBoot } from "./index.ts";
+import { D2E_COMPAT, applyD2eCompat, runD2eAtlasDbInit, runD2eBoot } from "./index.ts";
 
 Deno.test("compat is disabled by default", () => {
   assertEquals(D2E_COMPAT, false);
@@ -15,6 +15,12 @@ Deno.test("applyD2eCompat is a no-op when disabled (no throw, no routes)", () =>
 
 Deno.test("runD2eBoot resolves without side effects when disabled", async () => {
   await runD2eBoot();
+});
+
+Deno.test("runD2eAtlasDbInit resolves without side effects when disabled", async () => {
+  // index.ts chains this off startNativeWebApi(), which runs on every node —
+  // including ones with D2E_COMPAT off, where it must touch nothing at all.
+  await runD2eAtlasDbInit();
 });
 
 // ---------------------------------------------------------------------------

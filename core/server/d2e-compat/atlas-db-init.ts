@@ -1,7 +1,8 @@
 // d2e-compat/atlas-db-init.ts
 // Replaces the d2e `webapi-init` container: applies services/atlas-db-init/*.sql
 // after WebAPI's Flyway migrations and Logto's own migrations have landed.
-// Runs from d2eBoot(), which is invoked after startNativeWebApi().
+// Runs from d2eAtlasDbInit(), which index.ts invokes after startNativeWebApi()
+// — never from d2eBoot(), which completes before WebAPI has started.
 
 export interface TableRef {
   schema: string;
@@ -109,7 +110,7 @@ export interface AtlasDbInitDeps {
 }
 
 /** Returns the number of SQL files applied. Never throws — the caller runs
- *  inside d2eBoot(), where a failure must not take down boot. */
+ *  off the boot path, where a failure must not take down the node. */
 export async function applyAtlasDbInit(deps: AtlasDbInitDeps): Promise<number> {
   let names: string[];
   try {
