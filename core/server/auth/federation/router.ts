@@ -230,7 +230,7 @@ export function registerFederationRoutes(
       // then failing to write its account row would leave a user who exists,
       // owns no credential and no upstream link, and cannot sign in by any
       // route — and whose email would be found by the next flow's
-      // findUserIdByEmail and linked to.
+      // findLinkCandidateByEmail and linked to.
       let sessionUser;
       await client.query("BEGIN");
       try {

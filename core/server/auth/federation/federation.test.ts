@@ -5,9 +5,14 @@ import { hashBinding, signState, stateKeys, verifyState } from "./state.ts";
 import { challengeFor, createVerifier } from "./pkce.ts";
 import { clearDiscoveryCache, loadDiscovery } from "./discovery.ts";
 import { verifyFederatedIdToken } from "./verify.ts";
-import { decideLink } from "./link.ts";
+import { decideLink, emailDomain, emailDomainAllowed, isElevatedRole } from "./link.ts";
 import { resolveGroups } from "./groups.ts";
-import { findLinkedUser, resolveFederatedUser } from "./providers.ts";
+import {
+  findLinkCandidateByEmail,
+  findLinkedUser,
+  loadProviders,
+  resolveFederatedUser,
+} from "./providers.ts";
 import {
   _resetInsecureBindingWarning,
   bindingCookieName,
@@ -19,6 +24,7 @@ import {
   safeRedirectTo,
   warnIfInsecureBinding,
 } from "./request.ts";
+import type { ExistingUser } from "./link.ts";
 import type { ProviderConfig, UpstreamIdentity } from "./types.ts";
 
 Deno.test("federationEnabled is off unless explicitly enabled", () => {
@@ -405,18 +411,24 @@ const provider = (over: Partial<ProviderConfig> = {}): ProviderConfig => ({
   id: "logto", displayName: "Logto", clientId: "c", clientSecret: "s",
   issuer: "https://logto.test/oidc", discoveryUrl: "https://logto.test/d",
   scopes: "openid profile email", claimMap: {}, groupsSource: "none",
-  groupsClaim: null, linkPolicy: "verified_email", autoProvision: false, ...over,
+  groupsClaim: null, linkPolicy: "verified_email", autoProvision: false,
+  emailDomainAllowlist: null, allowElevatedAutoLink: false, ...over,
 });
 const identity = (verified: boolean): UpstreamIdentity => ({
   sub: "s-1", email: "jo@example.test", emailVerified: verified,
 });
 
+const ordinary = (id = "u-1"): ExistingUser => ({ id, role: "user" });
+
 Deno.test("verified email + existing user links", () => {
-  assertEquals(decideLink(identity(true), provider(), "u-1"), { action: "link", userId: "u-1" });
+  assertEquals(decideLink(identity(true), provider(), ordinary()), {
+    action: "link",
+    userId: "u-1",
+  });
 });
 
 Deno.test("unverified email never links, even to an existing user", () => {
-  const d = decideLink(identity(false), provider(), "u-1");
+  const d = decideLink(identity(false), provider(), ordinary());
   assertEquals(d.action, "refuse");
 });
 
@@ -435,6 +447,146 @@ Deno.test("verified email, no user, auto-provision on provisions", () => {
     decideLink(identity(true), provider({ autoProvision: true }), null),
     { action: "provision" },
   );
+});
+
+// The guards are only as good as the configuration reaching them, and the
+// column→field mapping is the one part of that with no type to catch it.
+Deno.test("the link guards are loaded off sso_provider onto ProviderConfig", async () => {
+  const row = (over: Record<string, unknown>) => ({
+    id: "logto", displayName: "Logto", clientId: "c", clientSecret: "s",
+    issuer: "https://logto.test/oidc", discovery_url: null,
+    scopes: "openid profile email", claim_map: {}, groups_source: "none",
+    groups_claim: null, link_policy: "verified_email", auto_provision: false, ...over,
+  });
+  const load = async (over: Record<string, unknown>) =>
+    (await loadProviders({ query: () => Promise.resolve({ rows: [row(over)] }) })).get("logto")!;
+
+  const configured = await load({
+    // As an operator would plausibly write them: mixed case, padding, and the
+    // '@' they think of as part of a domain.
+    email_domain_allowlist: [" Corp.TEST ", "@example.test"],
+    allow_elevated_auto_link: true,
+  });
+  assertEquals(configured.emailDomainAllowlist, ["corp.test", "example.test"]);
+  assertEquals(configured.allowElevatedAutoLink, true);
+
+  // Unset, and an empty list, both mean "no restriction" — an existing row is
+  // exactly as unrestricted as it was before these columns existed.
+  for (const allowlist of [null, undefined, []]) {
+    const p = await load({ email_domain_allowlist: allowlist });
+    assertEquals(p.emailDomainAllowlist, null);
+    assertEquals(p.allowElevatedAutoLink, false);
+  }
+  // Anything short of boolean true leaves the elevated guard on.
+  for (const raw of [undefined, null, "true", 1]) {
+    assertEquals((await load({ allow_elevated_auto_link: raw })).allowElevatedAutoLink, false);
+  }
+});
+
+// ── Link guards: domain allowlist and elevated accounts (link.ts) ──────────
+
+Deno.test("the domain is what follows the LAST '@', lower-cased", () => {
+  assertEquals(emailDomain("jo@Example.TEST"), "example.test");
+  // A quoted local part may itself contain '@'. Splitting on the first one
+  // would read "b" as the domain here, and would let a permissive upstream
+  // choose the domain trex checks.
+  assertEquals(emailDomain('"a@b"@attacker.test'), "attacker.test");
+  assertEquals(emailDomain('"victim@allowed.test"@attacker.test'), "attacker.test");
+  // Nothing usable.
+  assertEquals(emailDomain("nobody"), null);
+  assertEquals(emailDomain("@example.test"), null);
+  assertEquals(emailDomain("jo@"), null);
+});
+
+Deno.test("a null or empty allowlist restricts nothing", () => {
+  assertEquals(emailDomainAllowed("jo@anywhere.test", null), true);
+  assertEquals(emailDomainAllowed("jo@anywhere.test", []), true);
+});
+
+Deno.test("an allowlist matches the domain case-insensitively", () => {
+  assertEquals(emailDomainAllowed("Jo@Example.Test", ["example.test"]), true);
+  assertEquals(emailDomainAllowed("jo@example.test", ["EXAMPLE.TEST"]), true);
+  assertEquals(emailDomainAllowed("jo@other.test", ["example.test"]), false);
+  // A subdomain is a different domain; nothing here implies a suffix match.
+  assertEquals(emailDomainAllowed("jo@sub.example.test", ["example.test"]), false);
+  // An address with no determinable domain cannot satisfy a restriction.
+  assertEquals(emailDomainAllowed("nobody", ["example.test"]), false);
+});
+
+Deno.test("a verified email inside the allowlist links as before", () => {
+  const p = provider({ emailDomainAllowlist: ["example.test"] });
+  assertEquals(decideLink(identity(true), p, ordinary()), { action: "link", userId: "u-1" });
+});
+
+Deno.test("a verified email outside the allowlist is refused, with its own reason", () => {
+  const p = provider({ emailDomainAllowlist: ["corp.test"] });
+  assertEquals(decideLink(identity(true), p, ordinary()), {
+    action: "refuse",
+    reason: "email_domain_not_allowed",
+  });
+  // And it cannot provision its way in either: the address is not this
+  // provider's to speak for at all.
+  assertEquals(
+    decideLink(identity(true), provider({ emailDomainAllowlist: ["corp.test"], autoProvision: true }), null),
+    { action: "refuse", reason: "email_domain_not_allowed" },
+  );
+});
+
+Deno.test("a NULL allowlist leaves every existing behaviour untouched", () => {
+  const p = provider();
+  assertEquals(p.emailDomainAllowlist, null);
+  assertEquals(decideLink(identity(true), p, ordinary()), { action: "link", userId: "u-1" });
+  assertEquals(
+    decideLink(identity(true), provider({ autoProvision: true }), null),
+    { action: "provision" },
+  );
+});
+
+Deno.test("elevated is 'anything but the default role', and NULL is not elevated", () => {
+  assertEquals(isElevatedRole("admin"), true);
+  assertEquals(isElevatedRole("ADMIN"), true);
+  // A privileged value a deployment adds later must not fall outside the guard
+  // just because it is not spelled 'admin'.
+  assertEquals(isElevatedRole("superuser"), true);
+  assertEquals(isElevatedRole("user"), false);
+  assertEquals(isElevatedRole(" User "), false);
+  assertEquals(isElevatedRole(null), false);
+  assertEquals(isElevatedRole(undefined), false);
+  assertEquals(isElevatedRole(""), false);
+});
+
+Deno.test("an elevated target is not auto-linked by default", () => {
+  const admin: ExistingUser = { id: "u-admin", role: "admin" };
+  assertEquals(decideLink(identity(true), provider(), admin), {
+    action: "refuse",
+    reason: "elevated_account_link_refused",
+  });
+});
+
+Deno.test("an elevated target links when the provider opts in", () => {
+  const admin: ExistingUser = { id: "u-admin", role: "admin" };
+  assertEquals(
+    decideLink(identity(true), provider({ allowElevatedAutoLink: true }), admin),
+    { action: "link", userId: "u-admin" },
+  );
+});
+
+Deno.test("the two guards compose: an opted-in provider still obeys its allowlist", () => {
+  const admin: ExistingUser = { id: "u-admin", role: "admin" };
+  const p = provider({ allowElevatedAutoLink: true, emailDomainAllowlist: ["corp.test"] });
+  assertEquals(decideLink(identity(true), p, admin), {
+    action: "refuse",
+    reason: "email_domain_not_allowed",
+  });
+});
+
+Deno.test("ordinary users are unaffected by the elevated guard", () => {
+  for (const role of ["user", null, ""]) {
+    assertEquals(
+      decideLink(identity(true), provider(), { id: "u-1", role }),
+      { action: "link", userId: "u-1" },
+    );
+  }
 });
 
 // ── Group resolution (groups.ts) ────────────────────────────────────────────
@@ -606,6 +758,55 @@ Deno.test("with no link and no matching user, the provider's policy decides", as
       identity(false),
     )).action,
     "refuse",
+  );
+});
+
+Deno.test("the email lookup carries the role the elevated guard needs", async () => {
+  const found = await findLinkCandidateByEmail(
+    stubClient({ byEmail: [{ id: "u-1", role: "admin" }] }),
+    "jo@example.test",
+  );
+  assertEquals(found, { id: "u-1", role: "admin" });
+
+  // NULL role (the column is nullable, defaulting to 'user') is reported as
+  // null, not dropped, so isElevatedRole decides rather than `undefined`.
+  assertEquals(
+    await findLinkCandidateByEmail(stubClient({ byEmail: [{ id: "u-1" }] }), "jo@example.test"),
+    { id: "u-1", role: null },
+  );
+  assertEquals(await findLinkCandidateByEmail(stubClient({}), "jo@example.test"), null);
+});
+
+Deno.test("a first-time identity matching an admin's address is refused", async () => {
+  const client = stubClient({ byEmail: [{ id: "u-admin", role: "admin" }] });
+  assertEquals(
+    await resolveFederatedUser(client, provider(), identity(true)),
+    { action: "refuse", reason: "elevated_account_link_refused" },
+  );
+  assertEquals(client.seen, ["link", "email"]);
+});
+
+// The whole point of the additive guards: they gate the *first* link only.
+Deno.test("an existing link to an elevated user still signs in", async () => {
+  const client = stubClient({ linked: [{ userId: "u-admin", disabled: false }] });
+  assertEquals(
+    // Restrictive on both counts, and neither is consulted: this identity was
+    // linked already, so no linking decision is being made.
+    await resolveFederatedUser(
+      client,
+      provider({ emailDomainAllowlist: ["corp.test"] }),
+      { sub: "s-1", email: "jo@example.test", emailVerified: true },
+    ),
+    { action: "link", userId: "u-admin" },
+  );
+  assertEquals(client.seen, ["link"]);
+});
+
+Deno.test("a first-time identity outside the allowlist is refused before any link", async () => {
+  const client = stubClient({ byEmail: [{ id: "u-2", role: "user" }] });
+  assertEquals(
+    await resolveFederatedUser(client, provider({ emailDomainAllowlist: ["corp.test"] }), identity(true)),
+    { action: "refuse", reason: "email_domain_not_allowed" },
   );
 });
 

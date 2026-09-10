@@ -1,5 +1,5 @@
 // The only module in federation/ that talks to the database.
-import { decideLink, type LinkDecision } from "./link.ts";
+import { decideLink, type ExistingUser, type LinkDecision } from "./link.ts";
 import type { ProviderConfig, UpstreamIdentity } from "./types.ts";
 
 // deno-lint-ignore no-explicit-any
@@ -13,7 +13,8 @@ type PgClient = any;
 export async function loadProviders(client: PgClient): Promise<Map<string, ProviderConfig>> {
   const { rows } = await client.query(
     `SELECT id, "displayName", "clientId", "clientSecret", issuer, discovery_url,
-            scopes, claim_map, groups_source, groups_claim, link_policy, auto_provision
+            scopes, claim_map, groups_source, groups_claim, link_policy, auto_provision,
+            email_domain_allowlist, allow_elevated_auto_link
        FROM trexdb.sso_provider
       WHERE enabled = true AND issuer IS NOT NULL`,
   );
@@ -35,12 +36,26 @@ export async function loadProviders(client: PgClient): Promise<Map<string, Provi
       groupsClaim: r.groups_claim,
       linkPolicy: r.link_policy,
       autoProvision: r.auto_provision,
+      emailDomainAllowlist: normaliseDomains(r.email_domain_allowlist),
+      // `=== true` rather than a truthiness test: this decides whether an
+      // upstream may take over an administrator's account, and the one value
+      // that must enable it is the boolean true. Anything else — including a
+      // column an older database has not got — stays off.
+      allowElevatedAutoLink: r.allow_elevated_auto_link === true,
     });
   }
   return out;
 }
 
-export async function findUserIdByEmail(client: PgClient, email: string): Promise<string | null> {
+/**
+ * The trex user a verified upstream address resolves to, if any — with the
+ * role, because whether it may be auto-linked at all depends on it (see
+ * decideLink's elevated-account guard).
+ */
+export async function findLinkCandidateByEmail(
+  client: PgClient,
+  email: string,
+): Promise<ExistingUser | null> {
   const { rows } = await client.query(
     // A match here becomes a link decision: an upstream identity is handed
     // the account it resolves to. Soft-deleted and banned users must never
@@ -48,14 +63,31 @@ export async function findUserIdByEmail(client: PgClient, email: string): Promis
     // that address at the identity provider. Both columns are nullable with
     // NULL meaning "not disabled", so `banned = false` alone would wrongly
     // drop NULL rows; `IS NOT TRUE` treats NULL and false as not-banned.
-    `SELECT id FROM trexdb."user"
+    `SELECT id, role FROM trexdb."user"
       WHERE lower(email) = lower($1)
         AND "deletedAt" IS NULL
         AND banned IS NOT TRUE
       LIMIT 1`,
     [email],
   );
-  return rows[0]?.id ?? null;
+  const row = rows[0];
+  if (!row) return null;
+  return { id: row.id, role: row.role ?? null };
+}
+
+/**
+ * A configured allowlist, reduced to bare lower-cased domains. Whitespace and
+ * a leading '@' (a natural way to write a domain in configuration) are
+ * tolerated; anything empty is dropped, and a list left with nothing in it
+ * becomes `null`, i.e. "no restriction" — the same as an unset column.
+ */
+function normaliseDomains(raw: unknown): string[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out = raw
+    .filter((d): d is string => typeof d === "string")
+    .map((d) => d.trim().replace(/^@/, "").toLowerCase())
+    .filter((d) => d.length > 0);
+  return out.length > 0 ? out : null;
 }
 
 /** An existing (providerId, accountId) link, and whether its user may sign in. */
@@ -130,8 +162,10 @@ export async function resolveFederatedUser(
     return { action: "link", userId: linked.userId };
   }
   // First sighting of this upstream identity. Only now does email decide
-  // anything, and only under the provider's link policy.
-  return decideLink(identity, provider, await findUserIdByEmail(client, identity.email));
+  // anything, and only under the provider's link policy — and only here do the
+  // domain allowlist and the elevated-account guard apply. An identity with an
+  // account row above has already been through them and keeps signing in.
+  return decideLink(identity, provider, await findLinkCandidateByEmail(client, identity.email));
 }
 
 /** A federated user has no password: no row in account with providerId 'credential'. */
