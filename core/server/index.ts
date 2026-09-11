@@ -35,7 +35,7 @@ import { applyD2eCompat, applyD2eCompatEarly, assertD2eProvisioned, D2E_COMPAT, 
 import { parseReadyPort, startBootstrapReadySignal } from "./d2e-compat/bootstrap-ready.ts";
 import { collectProvisionTargets, runProvisionTargets } from "./plugin/provision.ts";
 import { collectNavEntries, mergeNav } from "./plugin/nav.ts";
-import { startNativeWebApi, waitForOidcDiscovery } from "./webapi-native.ts";
+import { startNativeWebApi } from "./webapi-native.ts";
 import { handleRealtimeUpgrade, mountRealtime, startRealtimeService, stopRealtimeService } from "./realtime/index.ts";
 
 console.log("main function started");
@@ -1467,51 +1467,33 @@ if (initialKeyName) {
   }
 }
 
-// Bind the listener before anything waits on the IdP. trex can serve its own
-// /oidc, so a wait that runs ahead of listen is a wait on this very process.
-server.listen(8000, () => {
-  console.log("server listening on port 8000");
-});
-
-// d2e boot and the plugin init functions talk to the IdP's token endpoint
-// (fhir-init posts /oauth/token, which forwards to LOGTO__TOKEN_URL). Until
-// #270 they were gated on it implicitly, because `await startNativeWebApi()`
-// ran first and that blocks on OIDC discovery. Moving WebAPI after listen was
-// right on its own terms but dropped the barrier, leaving boot racing the IdP:
-// the forward failed with "error sending request", /oauth/token answered 500
-// and FHIR init died, which stranded dataset creation behind it.
-//
-// So wait explicitly, here — after listen for the reason above, and over the
-// same bounded probes, so an IdP that never arrives costs the budget rather
-// than the node.
-await waitForOidcDiscovery(
-  (m) => console.log(m),
-  (m) => console.error(m),
-);
-
 await runD2eBoot();
 
-// The embedded WebAPI is part of the base image, not of d2e compatibility, so
-// it starts regardless of D2E_COMPAT (see WEBAPI_NATIVE_ENABLED). Starting it
-// here rather than from an external init job means a bare `restart` of this
-// container brings WebAPI back with it.
-//
-// It goes last, and deliberately after listen: WebAPI blocks on the OIDC
-// discovery document, and when trex is its own IdP that document is served by
-// this process. Starting it before the listener made the node wait on itself,
-// so WebAPI never launched and the health endpoint never answered.
-//
-// atlas-db-init chains off it rather than running inside runD2eBoot(): the
-// seeding waits for webapi.sec_role, which WebAPI's Flyway creates. From
-// runD2eBoot() that wait sits ahead of this line, so on a fresh database it
-// could never be satisfied — it timed out after ~120s and the stack came up
-// with no WebAPI admin permissions and no OIDC external role map, which is
-// what made SourceService.createSource answer "Access Denied" and stranded
-// d2e's dataset sync before it ever triggered the TrexSQL cache build.
-void startNativeWebApi()
-  .catch((e) => console.error("[webapi] start failed:", (e as Error)?.message ?? e))
-  .then(() => runD2eAtlasDbInit())
-  .catch((e) => console.error("[d2e-compat] atlas-db-init failed:", (e as Error)?.message ?? e));
+server.listen(8000, () => {
+  console.log("server listening on port 8000");
+
+  // The embedded WebAPI is part of the base image, not of d2e compatibility, so
+  // it starts regardless of D2E_COMPAT (see WEBAPI_NATIVE_ENABLED). Starting it
+  // here rather than from an external init job means a bare `restart` of this
+  // container brings WebAPI back with it.
+  //
+  // It goes last, and deliberately after listen: WebAPI blocks on the OIDC
+  // discovery document, and when trex is its own IdP that document is served by
+  // this process. Starting it before the listener made the node wait on itself,
+  // so WebAPI never launched and the health endpoint never answered.
+  //
+  // atlas-db-init chains off it rather than running inside runD2eBoot(): the
+  // seeding waits for webapi.sec_role, which WebAPI's Flyway creates. From
+  // runD2eBoot() that wait sits ahead of this line, so on a fresh database it
+  // could never be satisfied — it timed out after ~120s and the stack came up
+  // with no WebAPI admin permissions and no OIDC external role map, which is
+  // what made SourceService.createSource answer "Access Denied" and stranded
+  // d2e's dataset sync before it ever triggered the TrexSQL cache build.
+  void startNativeWebApi()
+    .catch((e) => console.error("[webapi] start failed:", (e as Error)?.message ?? e))
+    .then(() => runD2eAtlasDbInit())
+    .catch((e) => console.error("[d2e-compat] atlas-db-init failed:", (e as Error)?.message ?? e));
+});
 
 // Start the native realtime replication service without blocking boot — a
 // failure here (e.g. transient DB unavailability) must not take the node down.
