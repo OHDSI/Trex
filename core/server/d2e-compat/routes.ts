@@ -45,6 +45,7 @@ import { syncPrefectDatabaseCredentials } from "./prefect-sync.ts";
 import { upsertDatabaseCredential } from "./db-credential.ts";
 import { decryptSecret } from "../auth/crypto.ts";
 import { resolveIdpConfig } from "./idp.ts";
+import { postToIdpToken } from "./lib/idp-token.ts";
 import {
   CACHE_DIR,
   ensureCacheAttached,
@@ -65,6 +66,7 @@ import {
 function envGet(key: string): string {
   return Deno.env.get(key) ?? "";
 }
+
 
 /** Build a web Request from an Express req for proxying to a fetch-based worker. */
 async function buildWebRequest(req: any): Promise<Request> {
@@ -337,6 +339,7 @@ export function mountD2eRoutes(app: Express): void {
 
   // ─────────────────────────────────────────────────────────────────────────
   // /oauth/token — PKCE token exchange against the selected IdP  (PUBLIC)
+  // Transport failures are retried; see postToIdpToken.
   //
   // Ported from d2e services/trex/core/server/routes/base.ts.
   // Forwards the form body to the IdP's token endpoint, appending client_secret
@@ -387,11 +390,7 @@ export function mountD2eRoutes(app: Express): void {
       // client_secret_post only (secret is in the body). Logto rejects requests
       // that present client auth via two mechanisms, so do NOT also send a Basic
       // Authorization header.
-      const r = await fetch(tokenUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: params.toString(),
-      });
+      const r = await postToIdpToken(tokenUrl, params.toString());
       // Not every response is JSON: a rate-limited request comes back as plain
       // text, and parsing it unconditionally turned a 429 the caller could act
       // on into an opaque 500 that named nothing.
